@@ -1,0 +1,685 @@
+#!/usr/bin/env python3
+"""
+HK Weekend Arts Activities Map Generator
+Scrapes art-mate.net for the upcoming weekend and generates an interactive HTML map.
+
+Usage:
+    python3 hk_weekend_map.py              # auto-detect next weekend
+    python3 hk_weekend_map.py --sat 20260613 --sun 20260614   # specific dates
+    python3 hk_weekend_map.py --out ~/Desktop/hk_weekend_map.html
+"""
+
+import re
+import sys
+import json
+import time
+import argparse
+import urllib.request
+import urllib.parse
+from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from typing import Optional, Tuple, List, Dict
+
+# ── Config ─────────────────────────────────────────────────────────────────────
+BASE        = "https://www.art-mate.net"
+OUT_FILE    = Path.home() / "Desktop" / "hk_weekend_map.html"
+MAX_WORKERS = 15         # parallel detail-page fetchers
+PAGE_DELAY  = 0.15       # polite delay between listing page requests (seconds)
+HEADERS     = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"}
+
+# ── Known venue coordinates (substring-matched, case-insensitive) ───────────────
+# Ordered longest→shortest so specific keys match before generic ones.
+KNOWN_VENUES = [
+    # West Kowloon Cultural District
+    ("戲曲中心",           22.3053, 114.1610),
+    ("xiqu centre",        22.3053, 114.1610),
+    ("自由空間",           22.3040, 114.1590),
+    ("freespace",          22.3040, 114.1590),
+    ("西九文化區",         22.3033, 114.1601),
+    ("west kowloon",       22.3033, 114.1601),
+    # Tsim Sha Tsui
+    ("香港文化中心",       22.2943, 114.1705),
+    ("cultural centre",    22.2943, 114.1705),
+    ("太空館",             22.2959, 114.1710),
+    ("太空館",             22.2959, 114.1710),
+    ("香港藝術館",         22.2963, 114.1721),
+    ("museum of art",      22.2963, 114.1721),
+    ("柯士甸道",           22.3009, 114.1670),
+    ("austin road",        22.3009, 114.1670),
+    ("尖沙咀",             22.2980, 114.1718),
+    ("tsim sha tsui",      22.2980, 114.1718),
+    # Central / Sheung Wan
+    ("pmq",                22.2821, 114.1516),
+    ("元創方",             22.2821, 114.1516),
+    ("大館",               22.2800, 114.1556),
+    ("tai kwun",           22.2800, 114.1556),
+    ("藝穗會",             22.2817, 114.1568),
+    ("fringe club",        22.2817, 114.1568),
+    ("奶庫",               22.2817, 114.1568),
+    ("香港大會堂",         22.2826, 114.1668),
+    ("city hall",          22.2826, 114.1668),
+    ("中環",               22.2830, 114.1580),
+    ("central",            22.2830, 114.1580),
+    ("上環",               22.2856, 114.1499),
+    ("sheung wan",         22.2856, 114.1499),
+    # Wan Chai
+    ("香港藝術中心",       22.2799, 114.1718),
+    ("hong kong arts centre", 22.2799, 114.1718),
+    ("壽臣劇院",           22.2799, 114.1718),
+    ("shouson",            22.2799, 114.1718),
+    ("灣仔",               22.2780, 114.1720),
+    ("wan chai",           22.2780, 114.1720),
+    # Causeway Bay
+    ("銅鑼灣",             22.2810, 114.1842),
+    ("causeway bay",       22.2810, 114.1842),
+    ("維多利亞公園",       22.2839, 114.1877),
+    # Performing arts
+    ("香港演藝學院",       22.2786, 114.1742),
+    ("演藝學院",           22.2786, 114.1742),
+    ("hkapa",              22.2786, 114.1742),
+    ("香港體育館",         22.3033, 114.1840),
+    ("紅館",               22.3033, 114.1840),
+    ("紅磡",               22.3040, 114.1830),
+    ("hung hom",           22.3040, 114.1830),
+    # To Kwa Wan
+    ("牛棚",               22.3222, 114.1912),
+    ("cattle depot",       22.3222, 114.1912),
+    ("馬頭角",             22.3222, 114.1912),
+    # Kowloon City
+    ("九龍城",             22.3280, 114.1910),
+    ("kowloon city",       22.3280, 114.1910),
+    # Sham Shui Po
+    ("兆基創意書院",       22.3324, 114.1558),
+    ("hkicc",              22.3324, 114.1558),
+    ("深水埗",             22.3280, 114.1613),
+    ("sham shui po",       22.3280, 114.1613),
+    # Shek Kip Mei
+    ("賽馬會創意藝術中心", 22.3347, 114.1685),
+    ("jccac",              22.3347, 114.1685),
+    ("石硤尾",             22.3345, 114.1695),
+    # Mong Kok / Yau Ma Tei
+    ("旺角",               22.3190, 114.1694),
+    ("mong kok",           22.3190, 114.1694),
+    ("油麻地",             22.3130, 114.1700),
+    ("yau ma tei",         22.3130, 114.1700),
+    # San Po Kong / Kowloon East
+    ("同德工業大廈",       22.3390, 114.2082),
+    ("雙喜街",             22.3390, 114.2082),
+    ("新蒲崗",             22.3390, 114.2082),
+    ("san po kong",        22.3390, 114.2082),
+    ("東九文化中心",       22.3279, 114.2043),
+    ("east kowloon cultural", 22.3279, 114.2043),
+    ("觀塘",               22.3124, 114.2249),
+    ("kwun tong",          22.3124, 114.2249),
+    ("九龍灣",             22.3250, 114.2100),
+    ("kowloon bay",        22.3250, 114.2100),
+    ("啟德",               22.3288, 114.2028),
+    ("kai tak",            22.3288, 114.2028),
+    # Wong Tai Sin
+    ("黃大仙",             22.3413, 114.1933),
+    ("wong tai sin",       22.3413, 114.1933),
+    # Tsuen Wan
+    ("荃灣大會堂",         22.3715, 114.1178),
+    ("tsuen wan town hall", 22.3715, 114.1178),
+    ("南豐紗廠",           22.3714, 114.1128),
+    ("chat六廠",           22.3714, 114.1128),
+    ("chat 六廠",          22.3714, 114.1128),
+    ("六廠",               22.3714, 114.1128),
+    ("荃灣",               22.3705, 114.1185),
+    ("tsuen wan",          22.3705, 114.1185),
+    # Sha Tin
+    ("沙田大會堂",         22.3810, 114.1874),
+    ("sha tin town hall",  22.3810, 114.1874),
+    ("沙田",               22.3832, 114.1877),
+    ("sha tin",            22.3832, 114.1877),
+    # Yuen Long
+    ("元朗劇院",           22.4450, 114.0235),
+    ("yuen long theatre",  22.4450, 114.0235),
+    ("錦上路",             22.4467, 114.0604),
+    ("kam sheung",         22.4467, 114.0604),
+    ("元朗",               22.4420, 114.0220),
+    ("yuen long",          22.4420, 114.0220),
+    ("天水圍",             22.4490, 114.0080),
+    ("tin shui wai",       22.4490, 114.0080),
+    # Tai Po
+    ("大埔文娛中心",       22.4503, 114.1651),
+    ("大埔藝術中心",       22.4501, 114.1668),
+    ("tai po arts centre", 22.4501, 114.1668),
+    ("tai po community",   22.4503, 114.1651),
+    ("大埔",               22.4500, 114.1640),
+    ("tai po",             22.4500, 114.1640),
+    # Other NT
+    ("馬鞍山",             22.4248, 114.2316),
+    ("ma on shan",         22.4248, 114.2316),
+    ("上水",               22.5020, 114.1200),
+    ("sheung shui",        22.5020, 114.1200),
+    ("屯門",               22.3936, 113.9768),
+    ("tuen mun",           22.3936, 113.9768),
+    ("將軍澳",             22.3079, 114.2577),
+    ("tseung kwan o",      22.3079, 114.2577),
+    ("西貢",               22.3815, 114.2714),
+    ("sai kung",           22.3815, 114.2714),
+    # Islands
+    ("南丫",               22.2142, 114.1313),
+    ("lamma",              22.2142, 114.1313),
+    ("長洲",               22.2070, 114.0276),
+    ("cheung chau",        22.2070, 114.0276),
+    ("東涌",               22.2895, 113.9445),
+    ("tung chung",         22.2895, 113.9445),
+    ("大嶼山",             22.2650, 113.9460),
+    ("lantau",             22.2650, 113.9460),
+    # TST East / hotels
+    ("hotel stage",        22.2970, 114.1778),
+    ("the muse",           22.2970, 114.1778),
+    ("尖東",               22.2972, 114.1748),
+    ("tsim sha tsui east", 22.2972, 114.1748),
+    # AsiaWorld-Arena / HKIA area
+    ("asiaworld",          22.3098, 113.9347),
+    ("亞洲國際博覽館",     22.3098, 113.9347),
+    ("機場博覽館",         22.3098, 113.9347),
+    # Gallery spaces & museums
+    ("m+ 戲院",            22.3030, 114.1582),
+    ("m+",                 22.3030, 114.1582),
+    ("hart haus",          22.3714, 114.1128),   # inside CHAT六廠
+    ("vA!",                22.2826, 114.1668),
+    ("parasite",           22.2830, 114.1555),
+    ("hanart",             22.2826, 114.1668),
+    ("scad",               22.2800, 114.1556),
+    ("k11",                22.2987, 114.1720),
+    ("roommate",           22.2830, 114.1580),   # Central area gallery
+    ("尋樂",               22.3347, 114.1685),   # Shek Kip Mei area music shop
+    # Sports halls
+    ("東蒲",               22.3222, 114.1912),
+    ("李名靜體育館",       22.3222, 114.1912),
+    # North District
+    ("粉嶺",               22.4940, 114.1390),
+    ("fanling",            22.4940, 114.1390),
+    ("古洞",               22.5000, 114.1050),
+    # Sai Wan Ho / Shau Kei Wan
+    ("西灣河文娛中心",     22.2773, 114.2239),
+    ("西灣河",             22.2773, 114.2239),
+    ("sai wan ho",         22.2773, 114.2239),
+    # Hong Kong Film Archive
+    ("電影資料館",         22.2812, 114.2260),
+    ("film archive",       22.2812, 114.2260),
+    # Yau Tong / Kwun Tong east
+    ("油塘",               22.3056, 114.2372),
+    ("yau tong",           22.3056, 114.2372),
+    ("大本型",             22.3056, 114.2372),
+    # City University / Run Run Shaw
+    ("run run shaw",       22.3373, 114.1724),
+    ("creative media",     22.3373, 114.1724),
+    ("city university",    22.3373, 114.1724),
+    ("城市大學",           22.3373, 114.1724),
+    # Shenzhen
+    ("濱海藝術中心",       22.5316, 113.9317),
+    ("深圳",               22.5431, 114.0579),
+    ("shenzhen",           22.5431, 114.0579),
+]
+
+
+# ── HTTP helpers ────────────────────────────────────────────────────────────────
+
+def fetch(url: str, retries: int = 3):
+    for attempt in range(retries):
+        try:
+            req = urllib.request.Request(url, headers=HEADERS)
+            with urllib.request.urlopen(req, timeout=20) as r:
+                return r.read().decode("utf-8", errors="replace")
+        except Exception as e:
+            if attempt == retries - 1:
+                print(f"  ✗ fetch failed: {url}  ({e})", file=sys.stderr)
+            time.sleep(1 + attempt)
+    return None
+
+
+# ── Date helpers ────────────────────────────────────────────────────────────────
+
+def upcoming_weekend():
+    today = datetime.now()
+    dow = today.weekday()          # Mon=0 … Sun=6
+    days_to_sat = (5 - dow) % 7 or 7
+    sat = today + timedelta(days=days_to_sat)
+    sun = sat + timedelta(days=1)
+    return sat.strftime("%Y%m%d"), sun.strftime("%Y%m%d")
+
+
+# ── Scraping ────────────────────────────────────────────────────────────────────
+
+def get_max_page(html: str) -> int:
+    nums = [int(x) for x in re.findall(r"page=(\d+)", html)]
+    return max(nums) if nums else 1
+
+
+SKIP_TITLES = {"報名", "購票", "查看", "立即報名", "立即購票", "登記"}
+
+def extract_activities_from_page(html: str):
+    """Returns [(doc_id, title), ...] from one listing page."""
+    seen = set()
+    out = []
+    for doc_id, title in re.findall(
+        r"href='https://www\.art-mate\.net/doc/(\d+)[^']*' title='([^']+)'", html
+    ):
+        if doc_id not in seen and title not in SKIP_TITLES:
+            seen.add(doc_id)
+            out.append((doc_id, title))
+    return out
+
+
+def scrape_all_activities(date_str: str):
+    """Scrape all listing pages for a date. Returns {doc_id: title}."""
+    print(f"  Scraping listing pages for {date_str}…")
+    first_url = f"{BASE}/group/hk_coming_performance?period={date_str}&page=1"
+    first_html = fetch(first_url)
+    if not first_html:
+        return {}
+
+    max_page = get_max_page(first_html)
+    print(f"    Found {max_page} pages")
+
+    all_ids = {}
+
+    # Process page 1
+    for doc_id, title in extract_activities_from_page(first_html):
+        all_ids.setdefault(doc_id, title)
+
+    # Fetch remaining pages
+    for page in range(2, max_page + 1):
+        url = f"{BASE}/group/hk_coming_performance?period={date_str}&page={page}"
+        html = fetch(url)
+        if html:
+            for doc_id, title in extract_activities_from_page(html):
+                all_ids.setdefault(doc_id, title)
+        time.sleep(PAGE_DELAY)
+
+    print(f"    Total unique activities: {len(all_ids)}")
+    return all_ids
+
+
+def parse_detail(html: str, target_dates):
+    """Extract venue and relevant schedule slots from a detail page."""
+    # Venue link: first <a href='/doc/NNN?name=...'>NAME</a> after venue_icon
+    vm = re.search(
+        r"venue_icon[^>]*>.*?</span><span[^>]*><a href='(/doc/\d+\?name=[^']+)'>([^<]+)</a>",
+        html, re.S
+    )
+    venue_name = vm.group(2).strip() if vm else None
+
+    # All date/time slots
+    all_slots = re.findall(
+        r"dx_cell_wf1 dx_fs10 dx_lh15'>(\d{4}-\d{2}-\d{2}[^<]*)</span>", html
+    )
+    relevant = [s.strip() for s in all_slots if any(d in s for d in target_dates)]
+
+    return {"venue_name": venue_name, "schedule": relevant}
+
+
+def fetch_all_details(
+    doc_ids,
+    target_dates
+) :
+    """Parallel-fetch detail pages. Returns {doc_id: {title, venue_name, schedule}}."""
+    print(f"  Fetching {len(doc_ids)} detail pages (up to {MAX_WORKERS} in parallel)…")
+    results = {}
+
+    def worker(doc_id: str, title: str) -> tuple[str, dict]:
+        url = f"{BASE}/doc/{doc_id}"
+        html = fetch(url)
+        if not html:
+            return doc_id, {"title": title, "venue_name": None, "schedule": []}
+        detail = parse_detail(html, target_dates)
+        detail["title"] = title
+        return doc_id, detail
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        futures = {ex.submit(worker, doc_id, title): doc_id
+                   for doc_id, title in doc_ids.items()}
+        done = 0
+        for fut in as_completed(futures):
+            doc_id, info = fut.result()
+            results[doc_id] = info
+            done += 1
+            if done % 50 == 0:
+                print(f"    …{done}/{len(doc_ids)} detail pages fetched")
+
+    return results
+
+
+# ── Geocoding ──────────────────────────────────────────────────────────────────
+
+_geocode_cache = {}
+
+def geocode(venue_name):
+    if not venue_name:
+        return None
+    if venue_name in _geocode_cache:
+        return _geocode_cache[venue_name]
+
+    vl = venue_name.lower()
+    for key, lat, lng in KNOWN_VENUES:
+        if key.lower() in vl:
+            _geocode_cache[venue_name] = (lat, lng)
+            return (lat, lng)
+
+    # Nominatim fallback
+    try:
+        params = urllib.parse.urlencode({"q": venue_name, "countrycodes": "hk,cn",
+                                         "format": "json", "limit": 1})
+        req = urllib.request.Request(
+            f"https://nominatim.openstreetmap.org/search?{params}",
+            headers={"User-Agent": "HK-Weekend-Map/1.0"}
+        )
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.loads(r.read())
+        time.sleep(1.1)
+        if data:
+            coords = (float(data[0]["lat"]), float(data[0]["lon"]))
+            _geocode_cache[venue_name] = coords
+            return coords
+    except Exception:
+        pass
+
+    _geocode_cache[venue_name] = None
+    return None
+
+
+# ── Build venue list for the map ────────────────────────────────────────────────
+
+def build_venues(details, sat_date, sun_date, sat_ids, sun_ids):
+    """
+    Groups activities by geocoded venue.
+    Returns (venues_list, ungeocodable_list).
+    """
+    coord_map = {}
+    ungeocodable = []
+
+    for doc_id, info in details.items():
+        if not info.get("schedule"):   # no relevant slot → skip
+            continue
+
+        coords = geocode(info.get("venue_name"))
+        if not coords:
+            if info.get("venue_name"):
+                ungeocodable.append(info)
+            continue
+
+        lat, lng = coords
+        key = (round(lat, 4), round(lng, 4))
+        if key not in coord_map:
+            coord_map[key] = {
+                "lat": lat, "lng": lng,
+                "venue": info["venue_name"],
+                "sat_acts": [], "sun_acts": [],
+            }
+        entry = coord_map[key]
+
+        sat_slots = [s for s in info["schedule"] if sat_date in s]
+        sun_slots = [s for s in info["schedule"] if sun_date in s]
+        # Fallback: no specific slot found but activity is on listing for that day
+        if not sat_slots and doc_id in sat_ids:
+            sat_slots = ["Available this weekend"]
+        if not sun_slots and doc_id in sun_ids:
+            sun_slots = ["Available this weekend"]
+
+        act = {
+            "title":  info["title"],
+            "doc_id": doc_id,
+            "url":    f"{BASE}/doc/{doc_id}",
+        }
+        if sat_slots:
+            entry["sat_acts"].append({**act, "times": sat_slots})
+        if sun_slots:
+            entry["sun_acts"].append({**act, "times": sun_slots})
+
+    venues = []
+    for key, v in coord_map.items():
+        if not v["sat_acts"] and not v["sun_acts"]:
+            continue
+        has_sat = bool(v["sat_acts"])
+        has_sun = bool(v["sun_acts"])
+        day = "both" if (has_sat and has_sun) else ("sat" if has_sat else "sun")
+        venues.append({
+            "name": v["venue"],
+            "lat":  v["lat"],
+            "lng":  v["lng"],
+            "day":  day,
+            "sat_acts": v["sat_acts"],
+            "sun_acts": v["sun_acts"],
+        })
+
+    return venues, ungeocodable
+
+
+# ── HTML generation ─────────────────────────────────────────────────────────────
+
+def make_html(venues, sat_label: str, sun_label: str) :
+    venues_json = json.dumps(venues, ensure_ascii=False)
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+  <title>HK Weekend Activities – {sat_label} &amp; {sun_label}</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <style>
+    *{{margin:0;padding:0;box-sizing:border-box}}
+    body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}}
+    #hdr{{
+      position:fixed;top:0;left:0;right:0;z-index:1000;
+      background:rgba(255,255,255,.96);backdrop-filter:blur(10px);
+      padding:10px 18px;display:flex;align-items:center;gap:14px;
+      box-shadow:0 2px 12px rgba(0,0,0,.12)
+    }}
+    #hdr h1{{font-size:15px;font-weight:700;color:#111}}
+    #hdr p{{font-size:11px;color:#888;margin-top:1px}}
+    #filters{{display:flex;gap:6px;margin-left:auto;flex-wrap:wrap}}
+    .fb{{
+      padding:5px 13px;border-radius:16px;border:2px solid #ddd;
+      cursor:pointer;font-size:11px;font-weight:600;background:#fff;color:#555;
+      transition:all .15s
+    }}
+    .fa{{background:#374151;color:#fff;border-color:#374151}}
+    .fs{{background:#1d4ed8;color:#fff;border-color:#1d4ed8}}
+    .fn{{background:#d97706;color:#fff;border-color:#d97706}}
+    .fb2{{background:#059669;color:#fff;border-color:#059669}}
+    #map{{position:fixed;top:52px;left:0;right:0;bottom:0}}
+    /* popup */
+    .leaflet-popup-content-wrapper{{border-radius:10px;box-shadow:0 4px 20px rgba(0,0,0,.18)}}
+    .leaflet-popup-content{{margin:13px 15px;width:auto!important;min-width:260px;max-width:320px}}
+    .pv{{font-size:13px;font-weight:700;color:#111;margin-bottom:8px;border-bottom:2px solid #f0f0f0;padding-bottom:6px}}
+    .pd{{font-size:12px;font-weight:600;color:#555;margin:8px 0 4px;display:flex;align-items:center;gap:6px}}
+    .pd .badge{{
+      display:inline-block;padding:1px 7px;border-radius:8px;
+      font-size:10px;font-weight:700
+    }}
+    .bs{{background:#dbeafe;color:#1d4ed8}}
+    .bn{{background:#fef3c7;color:#b45309}}
+    .pe{{border-left:3px solid #e5e7eb;padding:4px 0 4px 8px;margin:4px 0}}
+    .pt{{font-size:12px;font-weight:600;color:#1a1a2e;line-height:1.3}}
+    .pm{{font-size:11px;color:#374151;margin-top:2px}}
+    .al{{font-size:10px;color:#1a73e8;text-decoration:none;display:inline-block;margin-top:2px}}
+    .al:hover{{text-decoration:underline}}
+    .gm{{
+      display:block;margin-top:10px;padding:6px;background:#1a73e8;
+      color:#fff;text-align:center;border-radius:6px;font-size:11px;
+      font-weight:600;text-decoration:none
+    }}
+    .gm:hover{{background:#1557b0}}
+    /* legend */
+    .legend{{background:#fff;padding:10px 14px;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,.15);font-size:12px;line-height:1.9}}
+    .legend b{{font-size:13px}}
+    .lr{{display:flex;align-items:center;gap:8px}}
+    .ld{{width:13px;height:13px;border-radius:50%;flex-shrink:0;border:2px solid #fff;box-shadow:0 1px 3px rgba(0,0,0,.25)}}
+    .lnote{{font-size:10px;color:#999;margin-top:4px}}
+  </style>
+</head>
+<body>
+<div id="hdr">
+  <div>
+    <h1>🎭 HK Weekend Activities</h1>
+    <p>{sat_label} (Sat) &amp; {sun_label} (Sun) · art-mate.net · Click a pin for details</p>
+  </div>
+  <div id="filters">
+    <button class="fb fa" id="b-all"  onclick="filt('all')">All</button>
+    <button class="fb"    id="b-sat"  onclick="filt('sat')">🟦 Sat {sat_label[:6]}</button>
+    <button class="fb"    id="b-sun"  onclick="filt('sun')">🟧 Sun {sun_label[:6]}</button>
+    <button class="fb"    id="b-both" onclick="filt('both')">🟩 Both Days</button>
+  </div>
+</div>
+<div id="map"></div>
+<script>
+const VENUES = {venues_json};
+
+const map = L.map('map').setView([22.355,114.155],12);
+L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png',{{
+  attribution:'© <a href="https://openstreetmap.org/copyright">OpenStreetMap</a>',
+  maxZoom:19
+}}).addTo(map);
+
+const CLR  = {{sat:'#1d4ed8',sun:'#d97706',both:'#059669'}};
+
+function buildPopup(v) {{
+  const gm = `https://www.google.com/maps/search/?api=1&query=${{v.lat}},${{v.lng}}`;
+  let html = `<div class="pv">${{v.name}}</div>`;
+  if (v.sat_acts.length) {{
+    html += `<div class="pd"><span class="badge bs">Sat {sat_label[:6]}</span></div>`;
+    for (const a of v.sat_acts) {{
+      const times = a.times.join('<br>');
+      html += `<div class="pe"><div class="pt">${{a.title}}</div>
+               <div class="pm">⏰ ${{times}}</div>
+               <a class="al" href="${{a.url}}" target="_blank">→ art-mate.net</a></div>`;
+    }}
+  }}
+  if (v.sun_acts.length) {{
+    html += `<div class="pd" style="margin-top:10px"><span class="badge bn">Sun {sun_label[:6]}</span></div>`;
+    for (const a of v.sun_acts) {{
+      const times = a.times.join('<br>');
+      html += `<div class="pe"><div class="pt">${{a.title}}</div>
+               <div class="pm">⏰ ${{times}}</div>
+               <a class="al" href="${{a.url}}" target="_blank">→ art-mate.net</a></div>`;
+    }}
+  }}
+  html += `<a class="gm" href="${{gm}}" target="_blank">📍 Open in Google Maps</a>`;
+  return html;
+}}
+
+const markers = [];
+VENUES.forEach(v => {{
+  const n  = v.sat_acts.length + v.sun_acts.length;
+  const sz = n >= 8 ? 40 : n >= 4 ? 34 : n >= 2 ? 28 : 24;
+  const col = CLR[v.day];
+  const icon = L.divIcon({{
+    className:'',
+    html:`<div style="width:${{sz}}px;height:${{sz}}px;background:${{col}};
+      border-radius:50%;border:3px solid white;
+      box-shadow:0 2px 10px rgba(0,0,0,.35);
+      display:flex;align-items:center;justify-content:center;
+      color:white;font-weight:700;font-size:${{n>9?9:11}}px;
+      font-family:-apple-system,sans-serif">${{n}}</div>`,
+    iconSize:[sz,sz],iconAnchor:[sz/2,sz/2]
+  }});
+  const m = L.marker([v.lat,v.lng],{{icon}})
+    .bindPopup(buildPopup(v),{{maxWidth:340,minWidth:270}})
+    .addTo(map);
+  m._day = v.day;
+  markers.push(m);
+}});
+
+// Legend
+const leg = L.control({{position:'bottomright'}});
+leg.onAdd = () => {{
+  const d = L.DomUtil.create('div','legend');
+  d.innerHTML = `<b>Legend</b>
+    <div class="lr"><div class="ld" style="background:#1d4ed8"></div> Saturday only</div>
+    <div class="lr"><div class="ld" style="background:#d97706"></div> Sunday only</div>
+    <div class="lr"><div class="ld" style="background:#059669"></div> Both days</div>
+    <div class="lnote">Number = activities at venue<br>Click a pin for full details</div>`;
+  return d;
+}};
+leg.addTo(map);
+
+function filt(type) {{
+  ['all','sat','sun','both'].forEach(t => {{
+    const b = document.getElementById('b-'+t);
+    b.className = 'fb';
+    if (t===type) b.className += ' '+(t==='all'?'fa':t==='sat'?'fs':t==='sun'?'fn':'fb2');
+  }});
+  markers.forEach(m => {{
+    const d = m._day;
+    const show = type==='all'||d===type||(type==='sat'&&d==='both')||(type==='sun'&&d==='both');
+    show ? m.addTo(map) : map.removeLayer(m);
+  }});
+}}
+</script>
+</body>
+</html>"""
+
+
+# ── Main ────────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description="HK Weekend Arts Map Generator")
+    parser.add_argument("--sat",  help="Saturday date YYYYMMDD")
+    parser.add_argument("--sun",  help="Sunday date YYYYMMDD")
+    parser.add_argument("--out",  help="Output HTML file path", default=str(OUT_FILE))
+    args = parser.parse_args()
+
+    if args.sat and args.sun:
+        sat_date, sun_date = args.sat, args.sun
+    else:
+        sat_date, sun_date = upcoming_weekend()
+
+    sat_label = datetime.strptime(sat_date, "%Y%m%d").strftime("%-d %b %Y")
+    sun_label = datetime.strptime(sun_date, "%Y%m%d").strftime("%-d %b %Y")
+    target_dates = {
+        datetime.strptime(sat_date, "%Y%m%d").strftime("%Y-%m-%d"),
+        datetime.strptime(sun_date, "%Y%m%d").strftime("%Y-%m-%d"),
+    }
+    sat_iso = datetime.strptime(sat_date, "%Y%m%d").strftime("%Y-%m-%d")
+    sun_iso = datetime.strptime(sun_date, "%Y%m%d").strftime("%Y-%m-%d")
+
+    print(f"\n🗓  Weekend: {sat_label} (Sat) & {sun_label} (Sun)")
+    print("=" * 55)
+
+    # 1. Scrape listing pages
+    print("\n[1/4] Scraping listing pages…")
+    sat_ids = scrape_all_activities(sat_date)
+    sun_ids = scrape_all_activities(sun_date)
+
+    # Merge: track which days each doc appears on
+    all_ids = {}
+    for doc_id, title in {**sat_ids, **sun_ids}.items():
+        all_ids[doc_id] = title
+
+    print(f"  Total unique activities (both days): {len(all_ids)}")
+
+    # 2. Fetch detail pages
+    print("\n[2/4] Fetching activity detail pages…")
+    details = fetch_all_details(all_ids, target_dates)
+    print(f"  Fetched {len(details)} detail pages")
+
+    # 3. Geocode & group by venue
+    print("\n[3/4] Geocoding venues…")
+    venues, ungeocodable = build_venues(details, sat_iso, sun_iso, sat_ids, sun_ids)
+    print(f"  Mapped {len(venues)} venues")
+    if ungeocodable:
+        print(f"  Could not geocode {len(ungeocodable)} activities:")
+        for a in ungeocodable[:5]:
+            print(f"    - {a.get('title','?')} @ {a.get('venue_name','?')}")
+        if len(ungeocodable) > 5:
+            print(f"    … and {len(ungeocodable)-5} more")
+
+    # 4. Generate HTML
+    print("\n[4/4] Generating HTML map…")
+    html = make_html(venues, sat_label, sun_label)
+    out_path = Path(args.out).expanduser()
+    out_path.write_text(html, encoding="utf-8")
+    print(f"  ✅ Saved to: {out_path}")
+    print(f"\n  {len(venues)} venue pins · {sum(len(v['sat_acts'])+len(v['sun_acts']) for v in venues)} activity entries")
+    print(f"  Open: open \"{out_path}\"")
+
+
+if __name__ == "__main__":
+    main()
