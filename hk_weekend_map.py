@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """
 HK Weekend Arts Activities Map Generator
-Scrapes art-mate.net for the upcoming weekend and generates an interactive HTML map.
+Scrapes art-mate.net, timable.com, and xplorehk.com for the upcoming weekend
+and generates an interactive HTML map.
 
 Usage:
     python3 hk_weekend_map.py              # auto-detect next weekend
-    python3 hk_weekend_map.py --sat 20260613 --sun 20260614   # specific dates
+    python3 hk_weekend_map.py --sat 20260613 --sun 20260614
     python3 hk_weekend_map.py --out ~/Desktop/hk_weekend_map.html
 """
 
 import re
 import sys
 import json
+import gzip
 import time
 import argparse
 import urllib.request
@@ -24,12 +26,23 @@ from typing import Optional, Tuple, List, Dict
 # ── Config ─────────────────────────────────────────────────────────────────────
 BASE        = "https://www.art-mate.net"
 OUT_FILE    = Path.home() / "Desktop" / "hk_weekend_map.html"
-MAX_WORKERS = 15         # parallel detail-page fetchers
-PAGE_DELAY  = 0.15       # polite delay between listing page requests (seconds)
+MAX_WORKERS = 15
+PAGE_DELAY  = 0.15
 HEADERS     = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"}
 
-# ── Known venue coordinates (substring-matched, case-insensitive) ───────────────
-# Ordered longest→shortest so specific keys match before generic ones.
+# Full browser headers required by timable.com (no brotli — stdlib can't decode it)
+TIMABLE_HEADERS = {
+    "User-Agent":      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "zh-HK,zh;q=0.9,en;q=0.8",
+    "Accept-Encoding": "gzip, deflate",   # NO br — brotli garbles without third-party lib
+}
+
+# XploreHK Google Sheets config (public sheet + public API key)
+XPLOREHK_SHEET_ID = "1G_8RMWjf0T9sNdMxKYy_Fc051I6zhdLLy6ehLak4CX4"
+XPLOREHK_KEY      = "AIzaSyCPyerGljBK4JJ-XA3aRr5cRvWssI3rwhI"
+
+# ── Known venue coordinates ─────────────────────────────────────────────────────
 KNOWN_VENUES = [
     # West Kowloon Cultural District
     ("戲曲中心",           22.3053, 114.1610),
@@ -41,7 +54,6 @@ KNOWN_VENUES = [
     # Tsim Sha Tsui
     ("香港文化中心",       22.2943, 114.1705),
     ("cultural centre",    22.2943, 114.1705),
-    ("太空館",             22.2959, 114.1710),
     ("太空館",             22.2959, 114.1710),
     ("香港藝術館",         22.2963, 114.1721),
     ("museum of art",      22.2963, 114.1721),
@@ -181,14 +193,14 @@ KNOWN_VENUES = [
     # Gallery spaces & museums
     ("m+ 戲院",            22.3030, 114.1582),
     ("m+",                 22.3030, 114.1582),
-    ("hart haus",          22.3714, 114.1128),   # inside CHAT六廠
+    ("hart haus",          22.3714, 114.1128),
     ("vA!",                22.2826, 114.1668),
     ("parasite",           22.2830, 114.1555),
     ("hanart",             22.2826, 114.1668),
     ("scad",               22.2800, 114.1556),
     ("k11",                22.2987, 114.1720),
-    ("roommate",           22.2830, 114.1580),   # Central area gallery
-    ("尋樂",               22.3347, 114.1685),   # Shek Kip Mei area music shop
+    ("roommate",           22.2830, 114.1580),
+    ("尋樂",               22.3347, 114.1685),
     # Sports halls
     ("東蒲",               22.3222, 114.1912),
     ("李名靜體育館",       22.3222, 114.1912),
@@ -216,12 +228,32 @@ KNOWN_VENUES = [
     ("濱海藝術中心",       22.5316, 113.9317),
     ("深圳",               22.5431, 114.0579),
     ("shenzhen",           22.5431, 114.0579),
+    # Extra venues for xplorehk coverage
+    ("赤柱",               22.2189, 114.2094),
+    ("stanley",            22.2189, 114.2094),
+    ("數碼港",             22.2627, 114.1295),
+    ("cyberport",          22.2627, 114.1295),
+    ("香港海事博物館",     22.2826, 114.1668),
+    ("海事博物館",         22.2826, 114.1668),
+    ("薄扶林",             22.2693, 114.1327),
+    ("pok fu lam",         22.2693, 114.1327),
+    ("牛池灣",             22.3400, 114.2222),
+    ("kowloon east",       22.3279, 114.2043),
+    ("炮台山",             22.2852, 114.1934),
+    ("fortress hill",      22.2852, 114.1934),
+    ("土瓜灣",             22.3150, 114.1916),
+    ("to kwa wan",         22.3150, 114.1916),
+    ("佐敦",               22.3055, 114.1694),
+    ("jordan",             22.3055, 114.1694),
+    ("西營盤",             22.2862, 114.1434),
+    ("sai ying pun",       22.2862, 114.1434),
 ]
 
 
 # ── HTTP helpers ────────────────────────────────────────────────────────────────
 
-def fetch(url: str, retries: int = 3):
+def fetch(url, retries=3):
+    """Simple fetch with basic User-Agent header."""
     for attempt in range(retries):
         try:
             req = urllib.request.Request(url, headers=HEADERS)
@@ -230,6 +262,24 @@ def fetch(url: str, retries: int = 3):
         except Exception as e:
             if attempt == retries - 1:
                 print(f"  ✗ fetch failed: {url}  ({e})", file=sys.stderr)
+            time.sleep(1 + attempt)
+    return None
+
+
+def fetch_gzip(url, retries=3):
+    """Fetch with full browser headers; handles gzip response (for timable)."""
+    for attempt in range(retries):
+        try:
+            req = urllib.request.Request(url, headers=TIMABLE_HEADERS)
+            with urllib.request.urlopen(req, timeout=25) as r:
+                raw = r.read()
+                enc = r.info().get("Content-Encoding", "")
+                if enc == "gzip":
+                    return gzip.decompress(raw).decode("utf-8", errors="replace")
+                return raw.decode("utf-8", errors="replace")
+        except Exception as e:
+            if attempt == retries - 1:
+                print(f"  ✗ fetch_gzip failed: {url}  ({e})", file=sys.stderr)
             time.sleep(1 + attempt)
     return None
 
@@ -245,17 +295,16 @@ def upcoming_weekend():
     return sat.strftime("%Y%m%d"), sun.strftime("%Y%m%d")
 
 
-# ── Scraping ────────────────────────────────────────────────────────────────────
+# ── Art-mate scraper ─────────────────────────────────────────────────────────────
 
-def get_max_page(html: str) -> int:
+def get_max_page(html):
     nums = [int(x) for x in re.findall(r"page=(\d+)", html)]
     return max(nums) if nums else 1
 
 
 SKIP_TITLES = {"報名", "購票", "查看", "立即報名", "立即購票", "登記"}
 
-def extract_activities_from_page(html: str):
-    """Returns [(doc_id, title), ...] from one listing page."""
+def extract_activities_from_page(html):
     seen = set()
     out = []
     for doc_id, title in re.findall(
@@ -267,24 +316,21 @@ def extract_activities_from_page(html: str):
     return out
 
 
-def scrape_all_activities(date_str: str):
+def scrape_all_activities(date_str):
     """Scrape all listing pages for a date. Returns {doc_id: title}."""
-    print(f"  Scraping listing pages for {date_str}…")
+    print(f"    Scraping art-mate listing pages for {date_str}…")
     first_url = f"{BASE}/group/hk_coming_performance?period={date_str}&page=1"
     first_html = fetch(first_url)
     if not first_html:
         return {}
 
     max_page = get_max_page(first_html)
-    print(f"    Found {max_page} pages")
+    print(f"      Found {max_page} pages")
 
     all_ids = {}
-
-    # Process page 1
     for doc_id, title in extract_activities_from_page(first_html):
         all_ids.setdefault(doc_id, title)
 
-    # Fetch remaining pages
     for page in range(2, max_page + 1):
         url = f"{BASE}/group/hk_coming_performance?period={date_str}&page={page}"
         html = fetch(url)
@@ -293,37 +339,29 @@ def scrape_all_activities(date_str: str):
                 all_ids.setdefault(doc_id, title)
         time.sleep(PAGE_DELAY)
 
-    print(f"    Total unique activities: {len(all_ids)}")
+    print(f"      Total unique activities: {len(all_ids)}")
     return all_ids
 
 
-def parse_detail(html: str, target_dates):
-    """Extract venue and relevant schedule slots from a detail page."""
-    # Venue link: first <a href='/doc/NNN?name=...'>NAME</a> after venue_icon
+def parse_detail(html, target_dates):
     vm = re.search(
         r"venue_icon[^>]*>.*?</span><span[^>]*><a href='(/doc/\d+\?name=[^']+)'>([^<]+)</a>",
         html, re.S
     )
     venue_name = vm.group(2).strip() if vm else None
-
-    # All date/time slots
     all_slots = re.findall(
         r"dx_cell_wf1 dx_fs10 dx_lh15'>(\d{4}-\d{2}-\d{2}[^<]*)</span>", html
     )
     relevant = [s.strip() for s in all_slots if any(d in s for d in target_dates)]
-
     return {"venue_name": venue_name, "schedule": relevant}
 
 
-def fetch_all_details(
-    doc_ids,
-    target_dates
-) :
-    """Parallel-fetch detail pages. Returns {doc_id: {title, venue_name, schedule}}."""
-    print(f"  Fetching {len(doc_ids)} detail pages (up to {MAX_WORKERS} in parallel)…")
+def fetch_all_details(doc_ids, target_dates):
+    """Parallel-fetch art-mate detail pages."""
+    print(f"    Fetching {len(doc_ids)} detail pages…")
     results = {}
 
-    def worker(doc_id: str, title: str) -> tuple[str, dict]:
+    def worker(doc_id, title):
         url = f"{BASE}/doc/{doc_id}"
         html = fetch(url)
         if not html:
@@ -341,12 +379,406 @@ def fetch_all_details(
             results[doc_id] = info
             done += 1
             if done % 50 == 0:
-                print(f"    …{done}/{len(doc_ids)} detail pages fetched")
+                print(f"      …{done}/{len(doc_ids)} detail pages fetched")
 
     return results
 
 
-# ── Geocoding ──────────────────────────────────────────────────────────────────
+# ── Timable scraper ──────────────────────────────────────────────────────────────
+
+def _extract_timable_docs(html):
+    """Extract the embedded docs JSON array from a timable page."""
+    m = re.search(r'"docs":\[', html)
+    if not m:
+        return []
+    start = m.end() - 1  # position of '['
+    depth = 0
+    for i in range(start, min(start + 1_000_000, len(html))):
+        c = html[i]
+        if c == '[':
+            depth += 1
+        elif c == ']':
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(html[start:i + 1])
+                except json.JSONDecodeError:
+                    return []
+    return []
+
+
+def _timable_section_on_date(section, target_date_str):
+    """
+    Check if a timable event section covers target_date_str (YYYY-MM-DD).
+    Returns (on_date: bool, time_str: str|None).
+    """
+    target_date = datetime.strptime(target_date_str, "%Y-%m-%d").date()
+
+    def parse_hkt(s):
+        s = re.sub(r"\.\d+Z?$", "", s.rstrip("Z"))
+        return datetime.fromisoformat(s) + timedelta(hours=8)
+
+    try:
+        start_hkt = parse_hkt(section["startDatetime"])
+    except (KeyError, ValueError):
+        return False, None
+
+    start_date = start_hkt.date()
+    is_repeat  = section.get("repeat", False)
+    to_this    = section.get("toThisDay")
+    end_str    = section.get("endDatetime")
+
+    if is_repeat and to_this:
+        try:
+            end_date = parse_hkt(to_this).date()
+        except ValueError:
+            return False, None
+        if not (start_date <= target_date <= end_date):
+            return False, None
+        weekdays = section.get("recurrance", {}).get("weekday", [])
+        if weekdays:
+            if target_date.strftime("%A").lower() not in weekdays:
+                return False, None
+    elif end_str:
+        try:
+            end_date = parse_hkt(end_str).date()
+        except ValueError:
+            return False, None
+        if not (start_date <= target_date <= end_date):
+            return False, None
+    else:
+        if start_date != target_date:
+            return False, None
+
+    # Format display time
+    if section.get("fullDay"):
+        time_str = "全日活動"
+    else:
+        time_str = start_hkt.strftime("%H:%M")
+        if end_str:
+            try:
+                time_str += "–" + parse_hkt(end_str).strftime("%H:%M")
+            except ValueError:
+                pass
+
+    return True, time_str
+
+
+def scrape_timable(sat_iso, sun_iso):
+    """
+    Scrape all pages of timable.com for the target weekend.
+    Returns list of activity dicts ready for build_venues.
+    """
+    print("  Scraping timable.com…")
+    base_tpl = (
+        "https://timable.com/hk/zh/event"
+        f"?time={sat_iso}%2C{sun_iso}&audience=&district=&category="
+        "&page={page}&limit=12"
+    )
+
+    page1 = fetch_gzip(base_tpl.format(page=1))
+    if not page1:
+        print("  ✗ Could not reach timable.com", file=sys.stderr)
+        return []
+
+    m = re.search(r'"totalPages":(\d+)', page1)
+    total_pages = int(m.group(1)) if m else 1
+    print(f"    timable: {total_pages} pages")
+
+    all_docs = _extract_timable_docs(page1)
+    for page in range(2, total_pages + 1):
+        html = fetch_gzip(base_tpl.format(page=page))
+        if html:
+            all_docs.extend(_extract_timable_docs(html))
+        time.sleep(PAGE_DELAY)
+
+    print(f"    timable: {len(all_docs)} events fetched")
+
+    acts = []
+    seen = set()  # deduplicate by (permalink, sat, sun)
+
+    for doc in all_docs:
+        name      = doc.get("name", "").strip()
+        permalink = doc.get("permalink", "")
+        if not name or not permalink:
+            continue
+        url = f"https://timable.com/hk/zh/event/{permalink}"
+
+        for section in doc.get("sections", []):
+            coord = section.get("coordinate")   # [lng, lat]
+            if not coord or len(coord) < 2:
+                continue
+            lng, lat = float(coord[0]), float(coord[1])
+            venue_name = (section.get("location") or {}).get("name", "") or ""
+            address    = section.get("address", "") or ""
+
+            on_sat, sat_time = _timable_section_on_date(section, sat_iso)
+            on_sun, sun_time = _timable_section_on_date(section, sun_iso)
+            if not on_sat and not on_sun:
+                continue
+
+            key = (permalink, on_sat, on_sun)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            acts.append({
+                "title":      name,
+                "url":        url,
+                "lat":        lat,
+                "lng":        lng,
+                "venue_name": venue_name or address[:40] or "(未知地點)",
+                "on_sat":     on_sat,
+                "on_sun":     on_sun,
+                "sat_times":  [sat_time or "Available this weekend"] if on_sat else [],
+                "sun_times":  [sun_time or "Available this weekend"] if on_sun else [],
+                "source":     "timable.com",
+            })
+
+    print(f"    timable activities on target weekend: {len(acts)}")
+    return acts
+
+
+# ── XploreHK scraper ─────────────────────────────────────────────────────────────
+
+def _parse_xplorehk_dates(date_str, sat_dt, sun_dt):
+    """
+    Parse xplorehk date field (D/M or ranges/lists) against target weekend.
+    Returns (on_sat: bool, on_sun: bool).
+    """
+    if not date_str or date_str.strip() in ("N/A", ""):
+        return False, False
+
+    year = sat_dt.year
+
+    def dm_to_date(s):
+        s = re.sub(r"^till\s*", "", s.strip(), flags=re.I)
+        m = re.match(r"^(\d{1,2})/(\d{1,2})$", s)
+        if not m:
+            return None
+        try:
+            return datetime(year, int(m.group(2)), int(m.group(1))).date()
+        except ValueError:
+            return None
+
+    on_sat = on_sun = False
+    for part in re.split(r"[,，]", date_str):
+        part = part.strip()
+        rm = re.match(r"^(\d{1,2}/\d{1,2})-(\d{1,2}/\d{1,2})$", part)
+        if rm:
+            s = dm_to_date(rm.group(1))
+            e = dm_to_date(rm.group(2))
+            if s and e:
+                if s <= sat_dt <= e: on_sat = True
+                if s <= sun_dt <= e: on_sun = True
+        else:
+            dt = dm_to_date(part)
+            if dt:
+                if dt == sat_dt: on_sat = True
+                if dt == sun_dt: on_sun = True
+
+    return on_sat, on_sun
+
+
+def scrape_xplorehk(sat_iso, sun_iso):
+    """
+    Scrape xplorehk.com via Google Sheets API and event.txt.
+    Returns list of activity dicts ready for build_venues.
+    """
+    print("  Scraping xplorehk.com…")
+    sat_dt = datetime.strptime(sat_iso, "%Y-%m-%d").date()
+    sun_dt = datetime.strptime(sun_iso, "%Y-%m-%d").date()
+    acts   = []
+
+    def fetch_sheet(sheet_name):
+        url = (
+            f"https://sheets.googleapis.com/v4/spreadsheets/"
+            f"{XPLOREHK_SHEET_ID}/values/{urllib.parse.quote(sheet_name)}/"
+            f"?key={XPLOREHK_KEY}"
+        )
+        raw = fetch(url)
+        if not raw:
+            return []
+        try:
+            return json.loads(raw).get("values", [])
+        except Exception:
+            return []
+
+    def clean_time(t):
+        return t if t and t.strip() not in ("N/A", "") else "Available this weekend"
+
+    # ── Event(new) sheet ──
+    # Cols: Available, Cost, Event name, Category, Cat2, Organizer, Link,
+    #       Date, Beginning Date, (empty), Time, Location, Photo, Area
+    event_rows = fetch_sheet("Event(new)")
+    print(f"    xplorehk Event(new): {len(event_rows)} rows")
+    event_count = 0
+    for row in event_rows[1:]:
+        if len(row) < 8:
+            continue
+        if row[0] != "Y":
+            continue
+        title    = row[2].strip() if len(row) > 2 else ""
+        if not title:
+            continue
+        link     = row[6].strip()  if len(row) > 6 else ""
+        date_str = row[7].strip()  if len(row) > 7 else ""
+        time_str = row[10].strip() if len(row) > 10 else ""
+        location = row[11].strip() if len(row) > 11 else ""
+
+        if not location or location == "N/A":
+            continue
+
+        on_sat, on_sun = _parse_xplorehk_dates(date_str, sat_dt, sun_dt)
+        if not on_sat and not on_sun:
+            continue
+
+        coords = geocode(location)
+        if not coords:
+            continue
+        lat, lng = coords
+
+        acts.append({
+            "title":      title,
+            "url":        link or "https://www.xplorehk.com",
+            "lat":        lat,
+            "lng":        lng,
+            "venue_name": location[:60],
+            "on_sat":     on_sat,
+            "on_sun":     on_sun,
+            "sat_times":  [clean_time(time_str)] if on_sat else [],
+            "sun_times":  [clean_time(time_str)] if on_sun else [],
+            "source":     "xplorehk.com",
+        })
+        event_count += 1
+
+    print(f"      xplorehk events on target weekend: {event_count}")
+
+    # ── Exhibition(new) sheet ──
+    # Cols: Available, Cost, Event name, Category, (empty), Organizer, Link,
+    #       Date (till D/M), Beginning Date, Ending Date, Time, Location, Photo, Area
+    exhib_rows = fetch_sheet("Exhibition(new)")
+    print(f"    xplorehk Exhibition(new): {len(exhib_rows)} rows")
+    exhib_count = 0
+
+    def parse_dm(s):
+        if not s:
+            return None
+        s = re.sub(r"^till\s*", "", s.strip(), flags=re.I)
+        m = re.match(r"^(\d{1,2})/(\d{1,2})$", s)
+        if not m:
+            return None
+        try:
+            return datetime(sat_dt.year, int(m.group(2)), int(m.group(1))).date()
+        except ValueError:
+            return None
+
+    for row in exhib_rows[1:]:
+        if len(row) < 10:
+            continue
+        if row[0] == "N":          # explicitly marked unavailable
+            continue
+        title    = row[2].strip() if len(row) > 2 else ""
+        if not title:
+            continue
+        link     = row[6].strip()  if len(row) > 6 else ""
+        begin_s  = row[8].strip()  if len(row) > 8 else ""
+        end_s    = row[9].strip()  if len(row) > 9 else ""
+        time_str = row[10].strip() if len(row) > 10 else ""
+        location = row[11].strip() if len(row) > 11 else ""
+
+        if not location or location == "N/A":
+            continue
+
+        begin_dt = parse_dm(begin_s)
+        end_dt   = parse_dm(end_s)
+        if not begin_dt or not end_dt:
+            continue
+
+        on_sat = (begin_dt <= sat_dt <= end_dt)
+        on_sun = (begin_dt <= sun_dt <= end_dt)
+        if not on_sat and not on_sun:
+            continue
+
+        coords = geocode(location)
+        if not coords:
+            continue
+        lat, lng = coords
+
+        acts.append({
+            "title":      title,
+            "url":        link or "https://www.xplorehk.com",
+            "lat":        lat,
+            "lng":        lng,
+            "venue_name": location[:60],
+            "on_sat":     on_sat,
+            "on_sun":     on_sun,
+            "sat_times":  [clean_time(time_str)] if on_sat else [],
+            "sun_times":  [clean_time(time_str)] if on_sun else [],
+            "source":     "xplorehk.com",
+        })
+        exhib_count += 1
+
+    print(f"      xplorehk exhibitions on target weekend: {exhib_count}")
+
+    # ── event.txt (Xplore Events, YYYY-MM-DD dates) ──
+    txt = fetch("https://www.xplorehk.com/event.txt")
+    txt_count = 0
+    if txt:
+        events_raw = []
+        cur = {}
+        for line in txt.splitlines():
+            line = line.strip()
+            if line.startswith("Event Name:"):
+                if cur.get("name"):
+                    events_raw.append(cur)
+                cur = {"name": line[11:].strip()}
+            elif line.startswith("Date:"):
+                cur["date"] = line[5:].strip()
+            elif line.startswith("Time:"):
+                cur["time"] = line[5:].strip()
+            elif line.startswith("Venue:"):
+                cur["venue"] = line[6:].strip()
+            elif line.startswith("Application link:"):
+                cur["link"] = line[17:].strip()
+        if cur.get("name"):
+            events_raw.append(cur)
+
+        for ev in events_raw:
+            date_s = ev.get("date", "")
+            on_sat = date_s == sat_iso
+            on_sun = date_s == sun_iso
+            if not on_sat and not on_sun:
+                continue
+            venue = ev.get("venue", "").strip()
+            if not venue or venue == "N/A":
+                continue
+            coords = geocode(venue)
+            if not coords:
+                continue
+            lat, lng = coords
+            acts.append({
+                "title":      ev.get("name", ""),
+                "url":        ev.get("link", "https://www.xplorehk.com"),
+                "lat":        lat,
+                "lng":        lng,
+                "venue_name": venue[:60],
+                "on_sat":     on_sat,
+                "on_sun":     on_sun,
+                "sat_times":  [clean_time(ev.get("time", ""))] if on_sat else [],
+                "sun_times":  [clean_time(ev.get("time", ""))] if on_sun else [],
+                "source":     "xplorehk.com",
+            })
+            txt_count += 1
+
+    if txt_count:
+        print(f"      xplorehk event.txt on target weekend: {txt_count}")
+
+    print(f"    xplorehk total activities on target weekend: {len(acts)}")
+    return acts
+
+
+# ── Geocoding ───────────────────────────────────────────────────────────────────
 
 _geocode_cache = {}
 
@@ -384,18 +816,36 @@ def geocode(venue_name):
     return None
 
 
-# ── Build venue list for the map ────────────────────────────────────────────────
+# ── Build venue list ─────────────────────────────────────────────────────────────
 
-def build_venues(details, sat_date, sun_date, sat_ids, sun_ids):
+def build_venues(artmate_details, timable_acts, xplorehk_acts,
+                 sat_date, sun_date, sat_ids, sun_ids):
     """
-    Groups activities by geocoded venue.
+    Groups activities from all three sources by geocoded coordinates.
     Returns (venues_list, ungeocodable_list).
     """
-    coord_map = {}
+    coord_map   = {}
     ungeocodable = []
 
-    for doc_id, info in details.items():
-        if not info.get("schedule"):   # no relevant slot → skip
+    def add_to_map(lat, lng, venue_name, sat_list, sun_list):
+        key = (round(lat, 4), round(lng, 4))
+        if key not in coord_map:
+            coord_map[key] = {
+                "lat": lat, "lng": lng,
+                "venue": venue_name,
+                "sat_acts": [], "sun_acts": [],
+            }
+        coord_map[key]["sat_acts"].extend(sat_list)
+        coord_map[key]["sun_acts"].extend(sun_list)
+
+    # ── Art-mate ──
+    for doc_id, info in artmate_details.items():
+        on_sat = doc_id in sat_ids
+        on_sun = doc_id in sun_ids
+        schedule = info.get("schedule", [])
+
+        # Skip if no evidence this activity is on the weekend
+        if not schedule and not on_sat and not on_sun:
             continue
 
         coords = geocode(info.get("venue_name"))
@@ -404,46 +854,69 @@ def build_venues(details, sat_date, sun_date, sat_ids, sun_ids):
                 ungeocodable.append(info)
             continue
 
-        lat, lng = coords
-        key = (round(lat, 4), round(lng, 4))
-        if key not in coord_map:
-            coord_map[key] = {
-                "lat": lat, "lng": lng,
-                "venue": info["venue_name"],
-                "sat_acts": [], "sun_acts": [],
-            }
-        entry = coord_map[key]
-
-        sat_slots = [s for s in info["schedule"] if sat_date in s]
-        sun_slots = [s for s in info["schedule"] if sun_date in s]
-        # Fallback: no specific slot found but activity is on listing for that day
-        if not sat_slots and doc_id in sat_ids:
+        sat_slots = [s for s in schedule if sat_date in s]
+        sun_slots = [s for s in schedule if sun_date in s]
+        if not sat_slots and on_sat:
             sat_slots = ["Available this weekend"]
-        if not sun_slots and doc_id in sun_ids:
+        if not sun_slots and on_sun:
             sun_slots = ["Available this weekend"]
+
+        if not sat_slots and not sun_slots:
+            continue
 
         act = {
             "title":  info["title"],
             "doc_id": doc_id,
             "url":    f"{BASE}/doc/{doc_id}",
+            "source": "art-mate.net",
         }
-        if sat_slots:
-            entry["sat_acts"].append({**act, "times": sat_slots})
-        if sun_slots:
-            entry["sun_acts"].append({**act, "times": sun_slots})
+        add_to_map(
+            coords[0], coords[1], info["venue_name"],
+            [{**act, "times": sat_slots}] if sat_slots else [],
+            [{**act, "times": sun_slots}] if sun_slots else [],
+        )
 
+    # ── Timable ──
+    for act in timable_acts:
+        entry = {
+            "title":  act["title"],
+            "doc_id": "",
+            "url":    act["url"],
+            "source": "timable.com",
+        }
+        add_to_map(
+            act["lat"], act["lng"], act["venue_name"],
+            [{**entry, "times": act["sat_times"]}] if act["on_sat"] else [],
+            [{**entry, "times": act["sun_times"]}] if act["on_sun"] else [],
+        )
+
+    # ── XploreHK ──
+    for act in xplorehk_acts:
+        entry = {
+            "title":  act["title"],
+            "doc_id": "",
+            "url":    act["url"],
+            "source": "xplorehk.com",
+        }
+        add_to_map(
+            act["lat"], act["lng"], act["venue_name"],
+            [{**entry, "times": act["sat_times"]}] if act["on_sat"] else [],
+            [{**entry, "times": act["sun_times"]}] if act["on_sun"] else [],
+        )
+
+    # Build final list
     venues = []
-    for key, v in coord_map.items():
+    for v in coord_map.values():
         if not v["sat_acts"] and not v["sun_acts"]:
             continue
         has_sat = bool(v["sat_acts"])
         has_sun = bool(v["sun_acts"])
         day = "both" if (has_sat and has_sun) else ("sat" if has_sat else "sun")
         venues.append({
-            "name": v["venue"],
-            "lat":  v["lat"],
-            "lng":  v["lng"],
-            "day":  day,
+            "name":     v["venue"],
+            "lat":      v["lat"],
+            "lng":      v["lng"],
+            "day":      day,
             "sat_acts": v["sat_acts"],
             "sun_acts": v["sun_acts"],
         })
@@ -453,7 +926,7 @@ def build_venues(details, sat_date, sun_date, sat_ids, sun_ids):
 
 # ── HTML generation ─────────────────────────────────────────────────────────────
 
-def make_html(venues, sat_label: str, sun_label: str) :
+def make_html(venues, sat_label, sun_label):
     venues_json = json.dumps(venues, ensure_ascii=False)
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -485,15 +958,11 @@ def make_html(venues, sat_label: str, sun_label: str) :
     .fn{{background:#d97706;color:#fff;border-color:#d97706}}
     .fb2{{background:#059669;color:#fff;border-color:#059669}}
     #map{{position:fixed;top:52px;left:0;right:0;bottom:0}}
-    /* popup */
     .leaflet-popup-content-wrapper{{border-radius:10px;box-shadow:0 4px 20px rgba(0,0,0,.18)}}
-    .leaflet-popup-content{{margin:13px 15px;width:auto!important;min-width:260px;max-width:320px}}
+    .leaflet-popup-content{{margin:13px 15px;width:auto!important;min-width:260px;max-width:340px}}
     .pv{{font-size:13px;font-weight:700;color:#111;margin-bottom:8px;border-bottom:2px solid #f0f0f0;padding-bottom:6px}}
     .pd{{font-size:12px;font-weight:600;color:#555;margin:8px 0 4px;display:flex;align-items:center;gap:6px}}
-    .pd .badge{{
-      display:inline-block;padding:1px 7px;border-radius:8px;
-      font-size:10px;font-weight:700
-    }}
+    .pd .badge{{display:inline-block;padding:1px 7px;border-radius:8px;font-size:10px;font-weight:700}}
     .bs{{background:#dbeafe;color:#1d4ed8}}
     .bn{{background:#fef3c7;color:#b45309}}
     .pe{{border-left:3px solid #e5e7eb;padding:4px 0 4px 8px;margin:4px 0}}
@@ -501,13 +970,19 @@ def make_html(venues, sat_label: str, sun_label: str) :
     .pm{{font-size:11px;color:#374151;margin-top:2px}}
     .al{{font-size:10px;color:#1a73e8;text-decoration:none;display:inline-block;margin-top:2px}}
     .al:hover{{text-decoration:underline}}
+    .src-badge{{
+      display:inline-block;font-size:9px;padding:1px 5px;border-radius:4px;
+      margin-left:4px;vertical-align:middle;font-weight:600;
+    }}
+    .src-artmate{{background:#ede9fe;color:#6d28d9}}
+    .src-timable{{background:#fce7f3;color:#be185d}}
+    .src-xplorehk{{background:#dcfce7;color:#15803d}}
     .gm{{
       display:block;margin-top:10px;padding:6px;background:#1a73e8;
       color:#fff;text-align:center;border-radius:6px;font-size:11px;
       font-weight:600;text-decoration:none
     }}
     .gm:hover{{background:#1557b0}}
-    /* legend */
     .legend{{background:#fff;padding:10px 14px;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,.15);font-size:12px;line-height:1.9}}
     .legend b{{font-size:13px}}
     .lr{{display:flex;align-items:center;gap:8px}}
@@ -519,7 +994,7 @@ def make_html(venues, sat_label: str, sun_label: str) :
 <div id="hdr">
   <div>
     <h1>🎭 HK Weekend Activities</h1>
-    <p>{sat_label} (Sat) &amp; {sun_label} (Sun) · art-mate.net · Click a pin for details</p>
+    <p>{sat_label} (Sat) &amp; {sun_label} (Sun) · art-mate · timable · xplorehk · Click a pin for details</p>
   </div>
   <div id="filters">
     <button class="fb fa" id="b-all"  onclick="filt('all')">All</button>
@@ -538,7 +1013,14 @@ L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png',{{
   maxZoom:19
 }}).addTo(map);
 
-const CLR  = {{sat:'#1d4ed8',sun:'#d97706',both:'#059669'}};
+const CLR = {{sat:'#1d4ed8',sun:'#d97706',both:'#059669'}};
+
+function srcBadge(src) {{
+  if (!src) return '';
+  const cls = src.includes('art-mate') ? 'src-artmate' :
+              src.includes('timable')  ? 'src-timable'  : 'src-xplorehk';
+  return `<span class="src-badge ${{cls}}">${{src}}</span>`;
+}}
 
 function buildPopup(v) {{
   const gm = `https://www.google.com/maps/search/?api=1&query=${{v.lat}},${{v.lng}}`;
@@ -547,18 +1029,24 @@ function buildPopup(v) {{
     html += `<div class="pd"><span class="badge bs">Sat {sat_label[:6]}</span></div>`;
     for (const a of v.sat_acts) {{
       const times = a.times.join('<br>');
-      html += `<div class="pe"><div class="pt">${{a.title}}</div>
-               <div class="pm">⏰ ${{times}}</div>
-               <a class="al" href="${{a.url}}" target="_blank">→ art-mate.net</a></div>`;
+      html += `<div class="pe">
+        <div class="pt">${{a.title}}</div>
+        <div class="pm">⏰ ${{times}}</div>
+        <a class="al" href="${{a.url}}" target="_blank">→ ${{a.source || 'art-mate.net'}}</a>
+        ${{srcBadge(a.source)}}
+      </div>`;
     }}
   }}
   if (v.sun_acts.length) {{
     html += `<div class="pd" style="margin-top:10px"><span class="badge bn">Sun {sun_label[:6]}</span></div>`;
     for (const a of v.sun_acts) {{
       const times = a.times.join('<br>');
-      html += `<div class="pe"><div class="pt">${{a.title}}</div>
-               <div class="pm">⏰ ${{times}}</div>
-               <a class="al" href="${{a.url}}" target="_blank">→ art-mate.net</a></div>`;
+      html += `<div class="pe">
+        <div class="pt">${{a.title}}</div>
+        <div class="pm">⏰ ${{times}}</div>
+        <a class="al" href="${{a.url}}" target="_blank">→ ${{a.source || 'art-mate.net'}}</a>
+        ${{srcBadge(a.source)}}
+      </div>`;
     }}
   }}
   html += `<a class="gm" href="${{gm}}" target="_blank">📍 Open in Google Maps</a>`;
@@ -581,7 +1069,7 @@ VENUES.forEach(v => {{
     iconSize:[sz,sz],iconAnchor:[sz/2,sz/2]
   }});
   const m = L.marker([v.lat,v.lng],{{icon}})
-    .bindPopup(buildPopup(v),{{maxWidth:340,minWidth:270}})
+    .bindPopup(buildPopup(v),{{maxWidth:360,minWidth:270}})
     .addTo(map);
   m._day = v.day;
   markers.push(m);
@@ -595,6 +1083,11 @@ leg.onAdd = () => {{
     <div class="lr"><div class="ld" style="background:#1d4ed8"></div> Saturday only</div>
     <div class="lr"><div class="ld" style="background:#d97706"></div> Sunday only</div>
     <div class="lr"><div class="ld" style="background:#059669"></div> Both days</div>
+    <div style="margin-top:6px;font-size:10px">
+      <span class="src-badge src-artmate">art-mate.net</span>
+      <span class="src-badge src-timable">timable.com</span>
+      <span class="src-badge src-xplorehk">xplorehk.com</span>
+    </div>
     <div class="lnote">Number = activities at venue<br>Click a pin for full details</div>`;
   return d;
 }};
@@ -633,52 +1126,57 @@ def main():
 
     sat_label = datetime.strptime(sat_date, "%Y%m%d").strftime("%-d %b %Y")
     sun_label = datetime.strptime(sun_date, "%Y%m%d").strftime("%-d %b %Y")
-    target_dates = {
-        datetime.strptime(sat_date, "%Y%m%d").strftime("%Y-%m-%d"),
-        datetime.strptime(sun_date, "%Y%m%d").strftime("%Y-%m-%d"),
-    }
-    sat_iso = datetime.strptime(sat_date, "%Y%m%d").strftime("%Y-%m-%d")
-    sun_iso = datetime.strptime(sun_date, "%Y%m%d").strftime("%Y-%m-%d")
+    sat_iso   = datetime.strptime(sat_date, "%Y%m%d").strftime("%Y-%m-%d")
+    sun_iso   = datetime.strptime(sun_date, "%Y%m%d").strftime("%Y-%m-%d")
+    target_dates = {sat_iso, sun_iso}
 
     print(f"\n🗓  Weekend: {sat_label} (Sat) & {sun_label} (Sun)")
-    print("=" * 55)
+    print("=" * 60)
 
-    # 1. Scrape listing pages
-    print("\n[1/4] Scraping listing pages…")
+    # 1. Art-mate listing pages
+    print("\n[1/5] Scraping art-mate.net listing pages…")
     sat_ids = scrape_all_activities(sat_date)
     sun_ids = scrape_all_activities(sun_date)
+    all_ids = {**sat_ids, **sun_ids}
+    print(f"  art-mate unique activities (both days): {len(all_ids)}")
 
-    # Merge: track which days each doc appears on
-    all_ids = {}
-    for doc_id, title in {**sat_ids, **sun_ids}.items():
-        all_ids[doc_id] = title
+    # 2. Art-mate detail pages
+    print("\n[2/5] Fetching art-mate.net detail pages…")
+    artmate_details = fetch_all_details(all_ids, target_dates)
+    print(f"  Fetched {len(artmate_details)} detail pages")
 
-    print(f"  Total unique activities (both days): {len(all_ids)}")
+    # 3. Timable
+    print("\n[3/5] Scraping timable.com…")
+    timable_acts = scrape_timable(sat_iso, sun_iso)
 
-    # 2. Fetch detail pages
-    print("\n[2/4] Fetching activity detail pages…")
-    details = fetch_all_details(all_ids, target_dates)
-    print(f"  Fetched {len(details)} detail pages")
+    # 4. XploreHK
+    print("\n[4/5] Scraping xplorehk.com…")
+    xplorehk_acts = scrape_xplorehk(sat_iso, sun_iso)
 
-    # 3. Geocode & group by venue
-    print("\n[3/4] Geocoding venues…")
-    venues, ungeocodable = build_venues(details, sat_iso, sun_iso, sat_ids, sun_ids)
-    print(f"  Mapped {len(venues)} venues")
+    # 5. Geocode & build venues
+    print("\n[5/5] Geocoding venues and building map…")
+    venues, ungeocodable = build_venues(
+        artmate_details, timable_acts, xplorehk_acts,
+        sat_iso, sun_iso, sat_ids, sun_ids
+    )
+    print(f"  Mapped {len(venues)} venue pins")
     if ungeocodable:
-        print(f"  Could not geocode {len(ungeocodable)} activities:")
+        print(f"  Could not geocode {len(ungeocodable)} art-mate activities:")
         for a in ungeocodable[:5]:
             print(f"    - {a.get('title','?')} @ {a.get('venue_name','?')}")
         if len(ungeocodable) > 5:
             print(f"    … and {len(ungeocodable)-5} more")
 
-    # 4. Generate HTML
-    print("\n[4/4] Generating HTML map…")
+    # Generate HTML
     html = make_html(venues, sat_label, sun_label)
     out_path = Path(args.out).expanduser()
     out_path.write_text(html, encoding="utf-8")
-    print(f"  ✅ Saved to: {out_path}")
-    print(f"\n  {len(venues)} venue pins · {sum(len(v['sat_acts'])+len(v['sun_acts']) for v in venues)} activity entries")
-    print(f"  Open: open \"{out_path}\"")
+
+    total_acts = sum(len(v["sat_acts"]) + len(v["sun_acts"]) for v in venues)
+    print(f"\n✅ Saved: {out_path}")
+    print(f"   {len(venues)} venue pins · {total_acts} total activity entries")
+    print(f"   art-mate: {len(all_ids)}  timable: {len(timable_acts)}  xplorehk: {len(xplorehk_acts)}")
+    print(f'\n   Open: open "{out_path}"')
 
 
 if __name__ == "__main__":
