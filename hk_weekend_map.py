@@ -503,6 +503,8 @@ def scrape_timable(sat_iso, sun_iso):
         if not name or not permalink:
             continue
         url = f"https://timable.com/hk/zh/event/{permalink}"
+        cat_items = [c.get("name", "") for c in (doc.get("categories") or []) if isinstance(c, dict)]
+        category  = ", ".join(filter(None, cat_items))
 
         for section in doc.get("sections", []):
             coord = section.get("coordinate")   # [lng, lat]
@@ -533,6 +535,7 @@ def scrape_timable(sat_iso, sun_iso):
                 "sat_times":  [sat_time or "Available this weekend"] if on_sat else [],
                 "sun_times":  [sun_time or "Available this weekend"] if on_sun else [],
                 "source":     "timable.com",
+                "category":   category,
             })
 
     print(f"    timable activities on target weekend: {len(acts)}")
@@ -625,6 +628,11 @@ def scrape_xplorehk(sat_iso, sun_iso):
         date_str = row[7].strip()  if len(row) > 7 else ""
         time_str = row[10].strip() if len(row) > 10 else ""
         location = row[11].strip() if len(row) > 11 else ""
+        cat1     = row[3].strip()  if len(row) > 3  else ""
+        cat2     = row[4].strip()  if len(row) > 4  else ""
+        category = cat1
+        if cat2 and cat2 not in cat1:
+            category = f"{cat1}, {cat2}" if cat1 else cat2
 
         if not location or location == "N/A":
             continue
@@ -649,6 +657,7 @@ def scrape_xplorehk(sat_iso, sun_iso):
             "sat_times":  [clean_time(time_str)] if on_sat else [],
             "sun_times":  [clean_time(time_str)] if on_sun else [],
             "source":     "xplorehk.com",
+            "category":   category,
         })
         event_count += 1
 
@@ -716,6 +725,7 @@ def scrape_xplorehk(sat_iso, sun_iso):
             "sat_times":  [clean_time(time_str)] if on_sat else [],
             "sun_times":  [clean_time(time_str)] if on_sun else [],
             "source":     "xplorehk.com",
+            "category":   "展覽",
         })
         exhib_count += 1
 
@@ -768,6 +778,7 @@ def scrape_xplorehk(sat_iso, sun_iso):
                 "sat_times":  [clean_time(ev.get("time", ""))] if on_sat else [],
                 "sun_times":  [clean_time(ev.get("time", ""))] if on_sun else [],
                 "source":     "xplorehk.com",
+                "category":   "",
             })
             txt_count += 1
 
@@ -865,10 +876,11 @@ def build_venues(artmate_details, timable_acts, xplorehk_acts,
             continue
 
         act = {
-            "title":  info["title"],
-            "doc_id": doc_id,
-            "url":    f"{BASE}/doc/{doc_id}",
-            "source": "art-mate.net",
+            "title":    info["title"],
+            "doc_id":   doc_id,
+            "url":      f"{BASE}/doc/{doc_id}",
+            "source":   "art-mate.net",
+            "category": "",
         }
         add_to_map(
             coords[0], coords[1], info["venue_name"],
@@ -879,10 +891,11 @@ def build_venues(artmate_details, timable_acts, xplorehk_acts,
     # ── Timable ──
     for act in timable_acts:
         entry = {
-            "title":  act["title"],
-            "doc_id": "",
-            "url":    act["url"],
-            "source": "timable.com",
+            "title":    act["title"],
+            "doc_id":   "",
+            "url":      act["url"],
+            "source":   "timable.com",
+            "category": act.get("category", ""),
         }
         add_to_map(
             act["lat"], act["lng"], act["venue_name"],
@@ -893,10 +906,11 @@ def build_venues(artmate_details, timable_acts, xplorehk_acts,
     # ── XploreHK ──
     for act in xplorehk_acts:
         entry = {
-            "title":  act["title"],
-            "doc_id": "",
-            "url":    act["url"],
-            "source": "xplorehk.com",
+            "title":    act["title"],
+            "doc_id":   "",
+            "url":      act["url"],
+            "source":   "xplorehk.com",
+            "category": act.get("category", ""),
         }
         add_to_map(
             act["lat"], act["lng"], act["venue_name"],
@@ -904,9 +918,23 @@ def build_venues(artmate_details, timable_acts, xplorehk_acts,
             [{**entry, "times": act["sun_times"]}] if act["on_sun"] else [],
         )
 
+    # Deduplicate activities within each venue by normalised title.
+    # Keeps the first occurrence (art-mate → timable → xplorehk priority).
+    def dedup_acts(acts):
+        seen = set()
+        out  = []
+        for a in acts:
+            key = re.sub(r"\s+", " ", a["title"].strip()).lower()
+            if key not in seen:
+                seen.add(key)
+                out.append(a)
+        return out
+
     # Build final list
     venues = []
     for v in coord_map.values():
+        v["sat_acts"] = dedup_acts(v["sat_acts"])
+        v["sun_acts"] = dedup_acts(v["sun_acts"])
         if not v["sat_acts"] and not v["sun_acts"]:
             continue
         has_sat = bool(v["sat_acts"])
@@ -926,7 +954,24 @@ def build_venues(artmate_details, timable_acts, xplorehk_acts,
 
 # ── HTML generation ─────────────────────────────────────────────────────────────
 
-def make_html(venues, sat_label, sun_label):
+def make_html(venues, sat_label, sun_label):  # noqa: C901
+    # Collect unique categories for the filter dropdown (Chinese first)
+    cats_set = set()
+    for v in venues:
+        for a in v.get("sat_acts", []) + v.get("sun_acts", []):
+            for c in re.split(r"[,，、]", a.get("category", "")):
+                c = c.strip()
+                if len(c) > 1:
+                    cats_set.add(c)
+
+    def _cat_sort(s):
+        return (0 if any("一" <= ch <= "鿿" for ch in s) else 1, s)
+
+    cat_opts = "\n".join(
+        f'<option value="{c}">{c}</option>'
+        for c in sorted(cats_set, key=_cat_sort)
+    )
+
     venues_json = json.dumps(venues, ensure_ascii=False)
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -935,72 +980,107 @@ def make_html(venues, sat_label, sun_label):
   <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
   <title>HK Weekend Activities – {sat_label} &amp; {sun_label}</title>
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css"/>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css"/>
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
   <style>
     *{{margin:0;padding:0;box-sizing:border-box}}
-    body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}}
-    #hdr{{
-      position:fixed;top:0;left:0;right:0;z-index:1000;
-      background:rgba(255,255,255,.96);backdrop-filter:blur(10px);
-      padding:10px 18px;display:flex;align-items:center;gap:14px;
-      box-shadow:0 2px 12px rgba(0,0,0,.12)
-    }}
-    #hdr h1{{font-size:15px;font-weight:700;color:#111}}
+    body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;font-size:13px}}
+    /* ── Header ── */
+    #hdr{{position:fixed;top:0;left:0;right:0;z-index:1000;
+      background:rgba(255,255,255,.97);backdrop-filter:blur(12px);
+      box-shadow:0 2px 14px rgba(0,0,0,.13)}}
+    #hdr-r1{{display:flex;align-items:center;gap:10px;padding:8px 16px}}
+    #hdr-r2{{display:flex;align-items:center;gap:8px;padding:5px 16px 8px;
+      border-top:1px solid #f0f0f0;flex-wrap:wrap}}
+    #hdr h1{{font-size:15px;font-weight:800;color:#111;white-space:nowrap}}
     #hdr p{{font-size:11px;color:#888;margin-top:1px}}
-    #filters{{display:flex;gap:6px;margin-left:auto;flex-wrap:wrap}}
-    .fb{{
-      padding:5px 13px;border-radius:16px;border:2px solid #ddd;
+    #day-btns{{display:flex;gap:5px;margin-left:auto;flex-shrink:0}}
+    .db{{padding:5px 12px;border-radius:16px;border:2px solid #ddd;
+      cursor:pointer;font-size:11px;font-weight:700;background:#fff;color:#555;
+      transition:all .15s;white-space:nowrap}}
+    .db-all{{background:#374151;color:#fff;border-color:#374151}}
+    .db-sat{{background:#DC2626;color:#fff;border-color:#DC2626}}
+    .db-sun{{background:#2563EB;color:#fff;border-color:#2563EB}}
+    .db-both{{background:#16A34A;color:#fff;border-color:#16A34A}}
+    #search{{flex:1;min-width:140px;max-width:280px;padding:6px 10px;
+      border:1.5px solid #ddd;border-radius:20px;font-size:12px;outline:none;
+      background:#fafafa;transition:border .15s}}
+    #search:focus{{border-color:#6366f1;background:#fff}}
+    #cat-filter{{padding:5px 8px;border:1.5px solid #ddd;border-radius:8px;
+      font-size:11px;outline:none;cursor:pointer;background:#fff;max-width:160px}}
+    #time-btns{{display:flex;gap:4px;flex-shrink:0}}
+    .tb{{padding:5px 9px;border-radius:12px;border:1.5px solid #ddd;
       cursor:pointer;font-size:11px;font-weight:600;background:#fff;color:#555;
-      transition:all .15s
-    }}
-    .fa{{background:#374151;color:#fff;border-color:#374151}}
-    .fs{{background:#1d4ed8;color:#fff;border-color:#1d4ed8}}
-    .fn{{background:#d97706;color:#fff;border-color:#d97706}}
-    .fb2{{background:#059669;color:#fff;border-color:#059669}}
-    #map{{position:fixed;top:52px;left:0;right:0;bottom:0}}
-    .leaflet-popup-content-wrapper{{border-radius:10px;box-shadow:0 4px 20px rgba(0,0,0,.18)}}
-    .leaflet-popup-content{{margin:13px 15px;width:auto!important;min-width:260px;max-width:340px}}
-    .pv{{font-size:13px;font-weight:700;color:#111;margin-bottom:8px;border-bottom:2px solid #f0f0f0;padding-bottom:6px}}
-    .pd{{font-size:12px;font-weight:600;color:#555;margin:8px 0 4px;display:flex;align-items:center;gap:6px}}
-    .pd .badge{{display:inline-block;padding:1px 7px;border-radius:8px;font-size:10px;font-weight:700}}
-    .bs{{background:#dbeafe;color:#1d4ed8}}
-    .bn{{background:#fef3c7;color:#b45309}}
-    .pe{{border-left:3px solid #e5e7eb;padding:4px 0 4px 8px;margin:4px 0}}
-    .pt{{font-size:12px;font-weight:600;color:#1a1a2e;line-height:1.3}}
+      transition:all .15s}}
+    .tb-on{{background:#6366f1;color:#fff;border-color:#6366f1}}
+    #result-count{{font-size:10px;color:#aaa;white-space:nowrap;margin-left:2px}}
+    /* Map */
+    #map{{position:fixed;top:90px;left:0;right:0;bottom:0}}
+    /* Popup */
+    .leaflet-popup-content-wrapper{{border-radius:12px;box-shadow:0 6px 24px rgba(0,0,0,.18)}}
+    .leaflet-popup-content{{margin:14px 16px;width:auto!important;min-width:260px;max-width:340px}}
+    .pv{{font-size:13px;font-weight:800;color:#111;margin-bottom:8px;
+      border-bottom:2px solid #f0f0f0;padding-bottom:6px}}
+    .pd{{font-size:11px;font-weight:700;color:#555;margin:8px 0 4px;
+      display:flex;align-items:center;gap:6px}}
+    .pd .badge{{display:inline-block;padding:2px 8px;border-radius:10px;
+      font-size:10px;font-weight:800}}
+    .bs{{background:#fee2e2;color:#DC2626}}
+    .bn{{background:#dbeafe;color:#1d4ed8}}
+    .pe{{border-left:3px solid #e5e7eb;padding:4px 0 4px 9px;margin:4px 0}}
+    .pt{{font-size:12px;font-weight:600;color:#1a1a2e;line-height:1.35}}
     .pm{{font-size:11px;color:#374151;margin-top:2px}}
-    .al{{font-size:10px;color:#1a73e8;text-decoration:none;display:inline-block;margin-top:2px}}
+    .al{{font-size:10px;color:#4f46e5;text-decoration:none;display:inline-block;margin-top:2px}}
     .al:hover{{text-decoration:underline}}
-    .src-badge{{
-      display:inline-block;font-size:9px;padding:1px 5px;border-radius:4px;
-      margin-left:4px;vertical-align:middle;font-weight:600;
-    }}
+    .src-badge{{display:inline-block;font-size:9px;padding:1px 5px;border-radius:4px;
+      margin-left:4px;vertical-align:middle;font-weight:600}}
     .src-artmate{{background:#ede9fe;color:#6d28d9}}
     .src-timable{{background:#fce7f3;color:#be185d}}
     .src-xplorehk{{background:#dcfce7;color:#15803d}}
-    .gm{{
-      display:block;margin-top:10px;padding:6px;background:#1a73e8;
-      color:#fff;text-align:center;border-radius:6px;font-size:11px;
-      font-weight:600;text-decoration:none
-    }}
-    .gm:hover{{background:#1557b0}}
-    .legend{{background:#fff;padding:10px 14px;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,.15);font-size:12px;line-height:1.9}}
+    .gm{{display:block;margin-top:11px;padding:8px;
+      background:#1F2937;color:#ffffff;
+      text-align:center;border-radius:8px;font-size:12px;
+      font-weight:700;text-decoration:none;letter-spacing:.3px}}
+    .gm:hover{{background:#111827}}
+    /* Legend */
+    .legend{{background:#fff;padding:10px 14px;border-radius:10px;
+      box-shadow:0 2px 12px rgba(0,0,0,.15);font-size:12px;line-height:2}}
     .legend b{{font-size:13px}}
     .lr{{display:flex;align-items:center;gap:8px}}
-    .ld{{width:13px;height:13px;border-radius:50%;flex-shrink:0;border:2px solid #fff;box-shadow:0 1px 3px rgba(0,0,0,.25)}}
-    .lnote{{font-size:10px;color:#999;margin-top:4px}}
+    .ld{{width:13px;height:13px;border-radius:50%;flex-shrink:0;
+      border:2px solid #fff;box-shadow:0 1px 3px rgba(0,0,0,.25)}}
+    .lnote{{font-size:10px;color:#999;margin-top:4px;line-height:1.5}}
   </style>
 </head>
 <body>
 <div id="hdr">
-  <div>
-    <h1>🎭 HK Weekend Activities</h1>
-    <p>{sat_label} (Sat) &amp; {sun_label} (Sun) · art-mate · timable · xplorehk · Click a pin for details</p>
+  <div id="hdr-r1">
+    <div>
+      <h1>🎭 HK Weekend Activities</h1>
+      <p>{sat_label} (Sat) &amp; {sun_label} (Sun) · art-mate · timable · xplorehk</p>
+    </div>
+    <div id="day-btns">
+      <button class="db db-all" id="b-all"  onclick="setDay('all')">All</button>
+      <button class="db"        id="b-sat"  onclick="setDay('sat')">🔴 Sat {sat_label[:6]}</button>
+      <button class="db"        id="b-sun"  onclick="setDay('sun')">🔵 Sun {sun_label[:6]}</button>
+      <button class="db"        id="b-both" onclick="setDay('both')">🟢 Both</button>
+    </div>
   </div>
-  <div id="filters">
-    <button class="fb fa" id="b-all"  onclick="filt('all')">All</button>
-    <button class="fb"    id="b-sat"  onclick="filt('sat')">🟦 Sat {sat_label[:6]}</button>
-    <button class="fb"    id="b-sun"  onclick="filt('sun')">🟧 Sun {sun_label[:6]}</button>
-    <button class="fb"    id="b-both" onclick="filt('both')">🟩 Both Days</button>
+  <div id="hdr-r2">
+    <input id="search" type="text" placeholder="🔍 Search activities, venues…" oninput="applyFilters()"/>
+    <select id="cat-filter" onchange="applyFilters()">
+      <option value="">All categories</option>
+      {cat_opts}
+    </select>
+    <div id="time-btns">
+      <button class="tb tb-on" id="t-all"       onclick="setTime('all')">All times</button>
+      <button class="tb"       id="t-morning"   onclick="setTime('morning')">🌅 Morning</button>
+      <button class="tb"       id="t-afternoon" onclick="setTime('afternoon')">☀️ Afternoon</button>
+      <button class="tb"       id="t-evening"   onclick="setTime('evening')">🌙 Evening</button>
+    </div>
+    <span id="result-count"></span>
   </div>
 </div>
 <div id="map"></div>
@@ -1013,12 +1093,54 @@ L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png',{{
   maxZoom:19
 }}).addTo(map);
 
-const CLR = {{sat:'#1d4ed8',sun:'#d97706',both:'#059669'}};
+// ── Colours ───────────────────────────────────────────────────────────────────
+const CLR = {{sat:'#DC2626', sun:'#2563EB', both:'#16A34A'}};
+
+// ── Cluster group ─────────────────────────────────────────────────────────────
+const mcg = L.markerClusterGroup({{
+  maxClusterRadius: 70,
+  disableClusteringAtZoom: 15,
+  iconCreateFunction(cluster) {{
+    const n  = cluster.getChildCount();
+    const sz = n > 50 ? 54 : n > 20 ? 46 : n > 10 ? 40 : 34;
+    return L.divIcon({{
+      className: '',
+      html: `<div style="width:${{sz}}px;height:${{sz}}px;
+        background:rgba(31,41,55,0.88);border-radius:50%;
+        border:3px solid #fff;box-shadow:0 3px 14px rgba(0,0,0,.4);
+        display:flex;align-items:center;justify-content:center;
+        color:#fff;font-weight:800;font-size:${{n>99?10:13}}px;
+        font-family:-apple-system,sans-serif">${{n}}</div>`,
+      iconSize: [sz,sz], iconAnchor: [sz/2,sz/2]
+    }});
+  }}
+}});
+map.addLayer(mcg);
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function getHour(s) {{
+  if (!s) return null;
+  s = s.replace(/\d{{4}}-\d{{2}}-\d{{2}}/g,'');
+  const m = s.match(/(\d{{1,2}})(?::\d{{2}})?\s*(am|pm)?/i);
+  if (!m) return null;
+  let h = +m[1];
+  const ap = (m[2]||'').toLowerCase();
+  if (ap==='pm' && h<12) h+=12;
+  if (ap==='am' && h===12) h=0;
+  if (h<5 || h>23) return null;
+  return h;
+}}
+
+function inSlot(h,slot) {{
+  if (slot==='morning')   return h>=6  && h<12;
+  if (slot==='afternoon') return h>=12 && h<18;
+  if (slot==='evening')   return h>=18;
+  return true;
+}}
 
 function srcBadge(src) {{
   if (!src) return '';
-  const cls = src.includes('art-mate') ? 'src-artmate' :
-              src.includes('timable')  ? 'src-timable'  : 'src-xplorehk';
+  const cls = src.includes('art-mate')?'src-artmate':src.includes('timable')?'src-timable':'src-xplorehk';
   return `<span class="src-badge ${{cls}}">${{src}}</span>`;
 }}
 
@@ -1026,25 +1148,23 @@ function buildPopup(v) {{
   const gm = `https://www.google.com/maps/search/?api=1&query=${{v.lat}},${{v.lng}}`;
   let html = `<div class="pv">${{v.name}}</div>`;
   if (v.sat_acts.length) {{
-    html += `<div class="pd"><span class="badge bs">Sat {sat_label[:6]}</span></div>`;
+    html += `<div class="pd"><span class="badge bs">🔴 Sat {sat_label[:6]}</span></div>`;
     for (const a of v.sat_acts) {{
-      const times = a.times.join('<br>');
       html += `<div class="pe">
         <div class="pt">${{a.title}}</div>
-        <div class="pm">⏰ ${{times}}</div>
-        <a class="al" href="${{a.url}}" target="_blank">→ ${{a.source || 'art-mate.net'}}</a>
+        <div class="pm">⏰ ${{a.times.join('<br>')}}</div>
+        <a class="al" href="${{a.url}}" target="_blank">→ ${{a.source||'art-mate.net'}}</a>
         ${{srcBadge(a.source)}}
       </div>`;
     }}
   }}
   if (v.sun_acts.length) {{
-    html += `<div class="pd" style="margin-top:10px"><span class="badge bn">Sun {sun_label[:6]}</span></div>`;
+    html += `<div class="pd" style="margin-top:8px"><span class="badge bn">🔵 Sun {sun_label[:6]}</span></div>`;
     for (const a of v.sun_acts) {{
-      const times = a.times.join('<br>');
       html += `<div class="pe">
         <div class="pt">${{a.title}}</div>
-        <div class="pm">⏰ ${{times}}</div>
-        <a class="al" href="${{a.url}}" target="_blank">→ ${{a.source || 'art-mate.net'}}</a>
+        <div class="pm">⏰ ${{a.times.join('<br>')}}</div>
+        <a class="al" href="${{a.url}}" target="_blank">→ ${{a.source||'art-mate.net'}}</a>
         ${{srcBadge(a.source)}}
       </div>`;
     }}
@@ -1053,58 +1173,100 @@ function buildPopup(v) {{
   return html;
 }}
 
-const markers = [];
+// ── Build markers ─────────────────────────────────────────────────────────────
+const allMarkers = [];
 VENUES.forEach(v => {{
-  const n  = v.sat_acts.length + v.sun_acts.length;
-  const sz = n >= 8 ? 40 : n >= 4 ? 34 : n >= 2 ? 28 : 24;
+  const n   = v.sat_acts.length + v.sun_acts.length;
+  const sz  = n >= 8 ? 42 : n >= 4 ? 36 : n >= 2 ? 30 : 26;
   const col = CLR[v.day];
   const icon = L.divIcon({{
     className:'',
     html:`<div style="width:${{sz}}px;height:${{sz}}px;background:${{col}};
-      border-radius:50%;border:3px solid white;
-      box-shadow:0 2px 10px rgba(0,0,0,.35);
+      border-radius:50%;border:3px solid #fff;
+      box-shadow:0 2px 10px rgba(0,0,0,.4);
       display:flex;align-items:center;justify-content:center;
-      color:white;font-weight:700;font-size:${{n>9?9:11}}px;
+      color:#fff;font-weight:800;font-size:${{n>9?10:12}}px;
       font-family:-apple-system,sans-serif">${{n}}</div>`,
     iconSize:[sz,sz],iconAnchor:[sz/2,sz/2]
   }});
   const m = L.marker([v.lat,v.lng],{{icon}})
-    .bindPopup(buildPopup(v),{{maxWidth:360,minWidth:270}})
-    .addTo(map);
-  m._day = v.day;
-  markers.push(m);
+    .bindPopup(buildPopup(v),{{maxWidth:360,minWidth:270}});
+  // Pre-compute filter metadata
+  const allActs  = v.sat_acts.concat(v.sun_acts);
+  const searchTx = (v.name+' '+allActs.map(a=>a.title+' '+(a.category||'')).join(' ')).toLowerCase();
+  const catList  = [...new Set(allActs.flatMap(a=>(a.category||'').split(',').map(c=>c.trim())).filter(Boolean))];
+  const hourList = allActs.flatMap(a=>a.times.map(getHour)).filter(h=>h!==null);
+  m._f = {{day:v.day, tx:searchTx, cats:catList, hrs:hourList}};
+  allMarkers.push(m);
 }});
+mcg.addLayers(allMarkers);
 
-// Legend
+// ── Filter state ──────────────────────────────────────────────────────────────
+let gDay='all', gTime='all';
+
+function applyFilters() {{
+  const q   = (document.getElementById('search').value||'').toLowerCase().trim();
+  const cat = (document.getElementById('cat-filter').value||'').toLowerCase();
+  const filtered = allMarkers.filter(m => {{
+    const f = m._f;
+    if (gDay!=='all') {{
+      if (gDay==='sat'  && f.day==='sun')  return false;
+      if (gDay==='sun'  && f.day==='sat')  return false;
+      if (gDay==='both' && f.day!=='both') return false;
+    }}
+    if (q && !f.tx.includes(q)) return false;
+    if (cat && !f.cats.some(c=>c.toLowerCase().includes(cat))) return false;
+    if (gTime!=='all' && f.hrs.length>0 && !f.hrs.some(h=>inSlot(h,gTime))) return false;
+    return true;
+  }});
+  mcg.clearLayers();
+  mcg.addLayers(filtered);
+  document.getElementById('result-count').textContent =
+    filtered.length < allMarkers.length
+      ? `${{filtered.length}} / ${{allMarkers.length}} venues`
+      : `${{allMarkers.length}} venues`;
+}}
+
+function setDay(d) {{
+  gDay = d;
+  ['all','sat','sun','both'].forEach(t => {{
+    const b = document.getElementById('b-'+t);
+    b.className = 'db';
+    if (t===d) b.classList.add('db-'+t);
+  }});
+  applyFilters();
+}}
+
+function setTime(t) {{
+  gTime = t;
+  ['all','morning','afternoon','evening'].forEach(k => {{
+    document.getElementById('t-'+k).className = 'tb'+(k===t?' tb-on':'');
+  }});
+  applyFilters();
+}}
+
+// ── Legend ────────────────────────────────────────────────────────────────────
 const leg = L.control({{position:'bottomright'}});
 leg.onAdd = () => {{
   const d = L.DomUtil.create('div','legend');
   d.innerHTML = `<b>Legend</b>
-    <div class="lr"><div class="ld" style="background:#1d4ed8"></div> Saturday only</div>
-    <div class="lr"><div class="ld" style="background:#d97706"></div> Sunday only</div>
-    <div class="lr"><div class="ld" style="background:#059669"></div> Both days</div>
-    <div style="margin-top:6px;font-size:10px">
-      <span class="src-badge src-artmate">art-mate.net</span>
-      <span class="src-badge src-timable">timable.com</span>
+    <div class="lr"><div class="ld" style="background:#DC2626"></div> Saturday only</div>
+    <div class="lr"><div class="ld" style="background:#2563EB"></div> Sunday only</div>
+    <div class="lr"><div class="ld" style="background:#16A34A"></div> Both days</div>
+    <div class="lr" style="margin-top:4px">
+      <div class="ld" style="background:rgba(31,41,55,.85)"></div> Cluster (zoom to expand)
+    </div>
+    <div style="margin-top:5px;font-size:9px;line-height:1.8">
+      <span class="src-badge src-artmate">art-mate.net</span>&nbsp;
+      <span class="src-badge src-timable">timable.com</span>&nbsp;
       <span class="src-badge src-xplorehk">xplorehk.com</span>
     </div>
-    <div class="lnote">Number = activities at venue<br>Click a pin for full details</div>`;
+    <div class="lnote">Number = activities at venue<br>Click pin for details</div>`;
   return d;
 }};
 leg.addTo(map);
 
-function filt(type) {{
-  ['all','sat','sun','both'].forEach(t => {{
-    const b = document.getElementById('b-'+t);
-    b.className = 'fb';
-    if (t===type) b.className += ' '+(t==='all'?'fa':t==='sat'?'fs':t==='sun'?'fn':'fb2');
-  }});
-  markers.forEach(m => {{
-    const d = m._day;
-    const show = type==='all'||d===type||(type==='sat'&&d==='both')||(type==='sun'&&d==='both');
-    show ? m.addTo(map) : map.removeLayer(m);
-  }});
-}}
+applyFilters();
 </script>
 </body>
 </html>"""
