@@ -526,7 +526,7 @@ def scrape_timable(sat_iso, sun_iso):
             if not on_sat and not on_sun:
                 continue
 
-            key = (permalink, on_sat, on_sun)
+            key = (event_id or permalink, on_sat, on_sun)
             if key in seen:
                 continue
             seen.add(key)
