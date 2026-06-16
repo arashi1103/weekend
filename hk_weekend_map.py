@@ -509,7 +509,7 @@ def scrape_timable(sat_iso, sun_iso):
         permalink = doc.get("permalink", "")
         if not name or not permalink:
             continue
-        url = f"https://timable.com/hk/zh/event/{permalink}"
+        url = f"https://timable.com/hk/zh/event/{urllib.parse.quote(permalink, safe='')}"
         cat_items = [c.get("name", "") for c in (doc.get("categories") or []) if isinstance(c, dict)]
         category  = ", ".join(filter(None, cat_items))
 
@@ -990,6 +990,12 @@ def make_html(venues, sat_label, sun_label):  # noqa: C901
 <head>
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no"/>
+  <meta name="theme-color" content="#6366f1"/>
+  <meta name="mobile-web-app-capable" content="yes"/>
+  <meta name="apple-mobile-web-app-capable" content="yes"/>
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
+  <meta name="apple-mobile-web-app-title" content="HK Weekend"/>
+  <link rel="manifest" href="manifest.json"/>
   <title>HK Weekend Activities – {sat_label} &amp; {sun_label}</title>
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
   <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css"/>
@@ -1520,6 +1526,11 @@ setTimeout(() => {{
   const el = document.getElementById('loading');
   if (el) {{ el.classList.add('fade'); setTimeout(() => {{ if(el.parentNode)el.remove(); }},550); }}
 }}, 4000);
+</script>
+<script>
+if ('serviceWorker' in navigator) {{
+  window.addEventListener('load', () => navigator.serviceWorker.register('sw.js'));
+}}
 </script>
 </body>
 </html>"""
