@@ -6,20 +6,6 @@ This repository functions as a lightweight Progressive Web App (PWA) that dynami
 
 ---
 
-## 📋 Table of Contents
-- [Features](#-features)
-- [Project Architecture](#-project-architecture)
-- [Tech Stack](#-tech-stack)
-- [Getting Started](#-getting-started)
-  - [Prerequisites](#prerequisites)
-  - [Local Installation](#local-installation)
-  - [Running the Data Pipeline](#running-the-data-pipeline)
-- [Automation & Deployment](#-automation--deployment)
-- [PWA Support](#-pwa-support)
-- [License](#-license)
-
----
-
 ## ✨ Features
 
 * **Interactive Geospatial Visualization:** Renders regional mapping details tailored for planning local Hong Kong weekend getaways.
