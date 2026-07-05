@@ -510,7 +510,7 @@ def scrape_timable(sat_iso, sun_iso):
         permalink = doc.get("permalink") or ""
         if not name or not (event_id or permalink):
             continue
-        # Hex-ID URLs are the only reliable form; permalink URLs return HTTP 500
+        # Hex ID URLs are reliable; permalink URLs return HTTP 500 on timable
         if event_id:
             url = f"https://timable.com/hk/zh/event/{event_id}"
         else:
@@ -518,11 +518,14 @@ def scrape_timable(sat_iso, sun_iso):
         cat_items = [c.get("name", "") for c in (doc.get("categories") or []) if isinstance(c, dict)]
         category  = ", ".join(filter(None, cat_items))
 
-        for section in doc.get("sections", []):
+        for section in doc.get("sections") or []:
             coord = section.get("coordinate")   # [lng, lat]
             if not coord or len(coord) < 2:
                 continue
-            lng, lat = float(coord[0]), float(coord[1])
+            try:
+                lng, lat = float(coord[0]), float(coord[1])
+            except (TypeError, ValueError):
+                continue
             venue_name = (section.get("location") or {}).get("name", "") or ""
             address    = section.get("address", "") or ""
 
@@ -1564,53 +1567,52 @@ def main():
     print(f"\n🗓  Weekend: {sat_label} (Sat) & {sun_label} (Sun)")
     print("=" * 60)
 
-    # Each source is independent: if one site breaks, log it and continue
-    # with the others so the map still gets generated and deployed.
-    import traceback
+    # Each source is independent: if one site breaks, log it and keep going
+    # so the map still deploys with the remaining sources.
+    source_errors = []
 
-    failed_sources = []
-
-    # 1+2. Art-mate
+    # 1. Art-mate listing pages
+    print("\n[1/5] Scraping art-mate.net listing pages…")
     sat_ids, sun_ids, all_ids, artmate_details = {}, {}, {}, []
     try:
-        print("\n[1/5] Scraping art-mate.net listing pages…")
         sat_ids = scrape_all_activities(sat_date)
         sun_ids = scrape_all_activities(sun_date)
         all_ids = {**sat_ids, **sun_ids}
         print(f"  art-mate unique activities (both days): {len(all_ids)}")
 
+        # 2. Art-mate detail pages
         print("\n[2/5] Fetching art-mate.net detail pages…")
         artmate_details = fetch_all_details(all_ids, target_dates)
         print(f"  Fetched {len(artmate_details)} detail pages")
-    except Exception:
-        failed_sources.append("art-mate.net")
-        print("  ✗ art-mate.net failed — continuing without it", file=sys.stderr)
-        traceback.print_exc()
+    except Exception as e:
+        source_errors.append(f"art-mate.net: {type(e).__name__}: {e}")
+        print(f"  ✗ art-mate.net failed, continuing: {e}", file=sys.stderr)
 
     # 3. Timable
+    print("\n[3/5] Scraping timable.com…")
     timable_acts = []
     try:
-        print("\n[3/5] Scraping timable.com…")
         timable_acts = scrape_timable(sat_iso, sun_iso)
-    except Exception:
-        failed_sources.append("timable.com")
-        print("  ✗ timable.com failed — continuing without it", file=sys.stderr)
-        traceback.print_exc()
+    except Exception as e:
+        source_errors.append(f"timable.com: {type(e).__name__}: {e}")
+        print(f"  ✗ timable.com failed, continuing: {e}", file=sys.stderr)
 
     # 4. XploreHK
+    print("\n[4/5] Scraping xplorehk.com…")
     xplorehk_acts = []
     try:
-        print("\n[4/5] Scraping xplorehk.com…")
         xplorehk_acts = scrape_xplorehk(sat_iso, sun_iso)
-    except Exception:
-        failed_sources.append("xplorehk.com")
-        print("  ✗ xplorehk.com failed — continuing without it", file=sys.stderr)
-        traceback.print_exc()
+    except Exception as e:
+        source_errors.append(f"xplorehk.com: {type(e).__name__}: {e}")
+        print(f"  ✗ xplorehk.com failed, continuing: {e}", file=sys.stderr)
 
-    if failed_sources:
-        print(f"\n⚠️  Sources failed this run: {', '.join(failed_sources)}", file=sys.stderr)
+    # If every source failed, the map would be empty — keep the old page instead
     if not artmate_details and not timable_acts and not xplorehk_acts:
-        sys.exit("✗ All three sources failed — refusing to generate an empty map.")
+        print("\n❌ All sources failed — aborting without writing output:",
+              file=sys.stderr)
+        for err in source_errors:
+            print(f"   {err}", file=sys.stderr)
+        sys.exit(1)
 
     # 5. Geocode & build venues
     print("\n[5/5] Geocoding venues and building map…")
@@ -1635,6 +1637,10 @@ def main():
     print(f"\n✅ Saved: {out_path}")
     print(f"   {len(venues)} venue pins · {total_acts} total activity entries")
     print(f"   art-mate: {len(all_ids)}  timable: {len(timable_acts)}  xplorehk: {len(xplorehk_acts)}")
+    if source_errors:
+        print("\n⚠️  Some sources failed this run (map built from the rest):")
+        for err in source_errors:
+            print(f"   {err}")
     print(f'\n   Open: open "{out_path}"')
 
 
