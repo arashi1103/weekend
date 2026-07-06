@@ -1,4 +1,4 @@
-const CACHE = 'hk-weekend-v1';
+const CACHE = 'hk-weekend-v2';
 const PRECACHE = [
   '/weekend/',
   '/weekend/index.html',

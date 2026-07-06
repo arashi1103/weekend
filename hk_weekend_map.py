@@ -291,7 +291,9 @@ def fetch_gzip(url, retries=3):
 # ── Date helpers ────────────────────────────────────────────────────────────────
 
 def upcoming_weekend():
-    today = datetime.now()
+    # Always reason in HKT: GitHub Actions runners are UTC, and a UTC clock
+    # near midnight would otherwise pick the wrong weekend.
+    today = datetime.utcnow() + timedelta(hours=8)
     dow = today.weekday()   # Mon=0 … Sat=5, Sun=6
     # On Sat/Sun show the current weekend; Mon-Fri show the coming one
     if dow == 5:    days_to_sat = 0
@@ -502,22 +504,30 @@ def scrape_timable(sat_iso, sun_iso):
     print(f"    timable: {len(all_docs)} events fetched")
 
     acts = []
-    seen = set()  # deduplicate by (permalink, sat, sun)
+    seen = set()  # deduplicate by (event_id, sat, sun)
 
     for doc in all_docs:
-        name      = doc.get("name", "").strip()
-        permalink = doc.get("permalink", "")
-        if not name or not permalink:
+        name      = (doc.get("name") or "").strip()
+        event_id  = doc.get("id") or doc.get("_id") or ""
+        permalink = doc.get("permalink") or ""
+        if not name or not (event_id or permalink):
             continue
-        url = f"https://timable.com/hk/zh/event/{urllib.parse.quote(permalink, safe='')}"
+        # Hex ID URLs are reliable; permalink URLs return HTTP 500 on timable
+        if event_id:
+            url = f"https://timable.com/hk/zh/event/{event_id}"
+        else:
+            url = f"https://timable.com/hk/zh/event/{urllib.parse.quote(permalink, safe='')}"
         cat_items = [c.get("name", "") for c in (doc.get("categories") or []) if isinstance(c, dict)]
         category  = ", ".join(filter(None, cat_items))
 
-        for section in doc.get("sections", []):
+        for section in doc.get("sections") or []:
             coord = section.get("coordinate")   # [lng, lat]
             if not coord or len(coord) < 2:
                 continue
-            lng, lat = float(coord[0]), float(coord[1])
+            try:
+                lng, lat = float(coord[0]), float(coord[1])
+            except (TypeError, ValueError):
+                continue
             venue_name = (section.get("location") or {}).get("name", "") or ""
             address    = section.get("address", "") or ""
 
@@ -798,7 +808,30 @@ def scrape_xplorehk(sat_iso, sun_iso):
 
 # ── Geocoding ───────────────────────────────────────────────────────────────────
 
-_geocode_cache = {}
+# Persistent cache: successful Nominatim lookups accumulate across weekly runs
+# in geocode_cache.json (committed to the repo), so venues only ever need to
+# be geocoded once. Failed lookups (None) are kept in-memory only, so they are
+# retried on the next run.
+GEOCODE_CACHE_FILE = Path(__file__).parent / "geocode_cache.json"
+
+def _load_geocode_cache():
+    try:
+        raw = json.loads(GEOCODE_CACHE_FILE.read_text(encoding="utf-8"))
+        return {k: tuple(v) for k, v in raw.items() if isinstance(v, list) and len(v) == 2}
+    except Exception:
+        return {}
+
+def _save_geocode_cache():
+    try:
+        persistable = {k: list(v) for k, v in _geocode_cache.items() if v is not None}
+        GEOCODE_CACHE_FILE.write_text(
+            json.dumps(persistable, ensure_ascii=False, indent=0, sort_keys=True),
+            encoding="utf-8")
+        print(f"  Geocode cache saved: {len(persistable)} venues")
+    except Exception as e:
+        print(f"  ⚠️ Could not save geocode cache: {e}", file=sys.stderr)
+
+_geocode_cache = _load_geocode_cache()
 
 def geocode(venue_name):
     if not venue_name:
@@ -966,7 +999,7 @@ def build_venues(artmate_details, timable_acts, xplorehk_acts,
 
 # ── HTML generation ─────────────────────────────────────────────────────────────
 
-def make_html(venues, sat_label, sun_label):  # noqa: C901
+def make_html(venues, sat_label, sun_label, updated_label=""):  # noqa: C901
     # Collect unique categories for the filter dropdown (Chinese first)
     cats_set = set()
     for v in venues:
@@ -1193,6 +1226,83 @@ def make_html(venues, sat_label, sun_label):  # noqa: C901
     }}
     .modal-close:hover{{opacity:.9;transform:translateY(-1px)}}
 
+    .upd{{font-weight:500;color:#6b7280;font-size:10px}}
+
+    /* ── List view toggle (bottom-center pill) ── */
+    #list-toggle{{
+      position:fixed;bottom:22px;left:50%;transform:translateX(-50%);z-index:1500;
+      min-height:44px;padding:10px 22px;border-radius:24px;
+      border:1px solid rgba(255,255,255,.35);
+      background:rgba(31,41,55,.92);color:#fff;
+      backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
+      font-size:13px;font-weight:700;cursor:pointer;
+      box-shadow:0 4px 20px rgba(0,0,0,.28);
+      transition:transform .18s,box-shadow .18s;
+      display:flex;align-items:center;gap:7px;
+    }}
+    #list-toggle:active{{transform:translateX(-50%) scale(.96)}}
+
+    /* ── List panel (bottom sheet on mobile, side panel on desktop) ── */
+    #list-panel{{
+      position:fixed;z-index:1400;
+      background:rgba(255,255,255,.96);
+      backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);
+      box-shadow:0 -8px 40px rgba(0,0,0,.18);
+      display:flex;flex-direction:column;
+      left:0;right:0;bottom:0;max-height:62dvh;
+      border-radius:20px 20px 0 0;
+      border-top:1px solid rgba(255,255,255,.8);
+      transform:translateY(105%);
+      transition:transform .28s cubic-bezier(.16,1,.3,1);
+    }}
+    #list-panel.open{{transform:translateY(0)}}
+    #list-head{{
+      flex-shrink:0;padding:10px 18px 8px;
+      display:flex;align-items:center;justify-content:space-between;
+      border-bottom:1px solid rgba(0,0,0,.06);position:relative;
+    }}
+    #list-head b{{font-size:14px;color:#111}}
+    #list-head .grab{{
+      position:absolute;top:6px;left:50%;transform:translateX(-50%);
+      width:36px;height:4px;border-radius:2px;background:rgba(0,0,0,.15);
+    }}
+    #list-close{{
+      width:30px;height:30px;border-radius:50%;border:none;cursor:pointer;
+      background:rgba(0,0,0,.06);color:#374151;font-size:14px;font-weight:700;
+    }}
+    #list-body{{overflow-y:auto;-webkit-overflow-scrolling:touch;padding:4px 0 14px}}
+    .lv-row{{
+      display:flex;align-items:center;gap:11px;
+      padding:11px 18px;min-height:44px;cursor:pointer;
+      border-bottom:1px solid rgba(0,0,0,.045);
+    }}
+    .lv-row:active{{background:rgba(99,102,241,.07)}}
+    .lv-dot{{width:11px;height:11px;border-radius:50%;flex-shrink:0;
+      border:2px solid #fff;box-shadow:0 1px 3px rgba(0,0,0,.25)}}
+    .lv-txt{{flex:1;min-width:0}}
+    .lv-venue{{font-size:13px;font-weight:700;color:#111;
+      white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+    .lv-preview{{font-size:11px;color:#6b7280;margin-top:1px;
+      white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+    .lv-n{{flex-shrink:0;min-width:26px;height:22px;padding:0 7px;border-radius:11px;
+      background:rgba(99,102,241,.12);color:#4f46e5;
+      font-size:11px;font-weight:800;
+      display:flex;align-items:center;justify-content:center}}
+    .lv-empty{{padding:36px 20px;text-align:center;color:#9ca3af;font-size:13px}}
+
+    /* Desktop: side panel instead of bottom sheet */
+    @media(min-width:641px){{
+      #list-panel{{
+        left:auto;top:110px;right:12px;bottom:12px;width:360px;max-height:none;
+        border-radius:16px;border:1px solid rgba(255,255,255,.8);
+        transform:translateX(115%);
+      }}
+      #list-panel.open{{transform:translateX(0)}}
+      #list-head .grab{{display:none}}
+      #list-toggle{{left:auto;right:22px;transform:none}}
+      #list-toggle:active{{transform:scale(.96)}}
+    }}
+
     /* ── Mobile ── */
     @media(max-width:640px){{
       #hdr-r1{{padding:8px 12px;gap:8px}}
@@ -1225,7 +1335,7 @@ def make_html(venues, sat_label, sun_label):  # noqa: C901
   <div id="hdr-r1">
     <div class="hdr-title">
       <h1>🎭 HK Weekend Activities</h1>
-      <div class="dates" id="hdr-dates">📅 {sat_label} (Sat) &amp; {sun_label} (Sun)</div>
+      <div class="dates" id="hdr-dates">📅 {sat_label} (Sat) &amp; {sun_label} (Sun)<span class="upd">{updated_label}</span></div>
     </div>
     <button id="help-btn" onclick="toggleHelp()" title="How to use">?</button>
     <div id="day-btns">
@@ -1253,6 +1363,17 @@ def make_html(venues, sat_label, sun_label):  # noqa: C901
 
 <div id="map"></div>
 
+<!-- List view -->
+<button id="list-toggle" onclick="toggleList()">☰ List</button>
+<div id="list-panel">
+  <div id="list-head">
+    <div class="grab"></div>
+    <b id="list-title">Venues</b>
+    <button id="list-close" onclick="toggleList()">✕</button>
+  </div>
+  <div id="list-body"></div>
+</div>
+
 <!-- Help modal -->
 <div id="help-modal" onclick="toggleHelp()">
   <div class="modal-box" onclick="event.stopPropagation()">
@@ -1263,6 +1384,7 @@ def make_html(venues, sat_label, sun_label):  # noqa: C901
       <li>Filter by <b>Sat / Sun / Both</b> using the day buttons</li>
       <li>Filter by <b>category</b> or <b>time of day</b> in the second row</li>
       <li>Use <b>Search</b> to find by activity name, venue or keyword</li>
+      <li>Tap <b>☰ List</b> to browse venues as a list — tap a row to jump to it</li>
       <li>Tap <b>⌂</b> on the map to reset to the Hong Kong view</li>
       <li>Tap <b>📍</b> to show your current location</li>
     </ul>
@@ -1442,12 +1564,46 @@ VENUES.forEach(v => {{
   const catList  = [...new Set(allActs.flatMap(a=>(a.category||'').split(/[,，、]/).map(c=>c.trim())).filter(Boolean))];
   const hourList = allActs.flatMap(a=>a.times.map(getHour)).filter(h=>h!==null);
   m._f = {{day:v.day, tx:searchTx, cats:catList, hrs:hourList}};
+  m._v = v;
   allMarkers.push(m);
 }});
 mcg.addLayers(allMarkers);
 
 // ── Filter state ──────────────────────────────────────────────────────────────
 let gDay='all', gTime='all';
+let gFiltered = allMarkers;
+
+// Remember filters across visits
+function saveFilters() {{
+  try {{
+    localStorage.setItem('hkw-filters', JSON.stringify({{
+      day: gDay, time: gTime,
+      cat: document.getElementById('cat-filter').value || '',
+      q:   document.getElementById('search').value || ''
+    }}));
+  }} catch(e) {{}}
+}}
+
+function restoreFilters() {{
+  try {{
+    const s = JSON.parse(localStorage.getItem('hkw-filters') || '{{}}');
+    if (s.day  && ['all','sat','sun','both'].includes(s.day)) gDay = s.day;
+    if (s.time && ['all','morning','afternoon','evening'].includes(s.time)) gTime = s.time;
+    if (s.q) document.getElementById('search').value = s.q;
+    if (s.cat) {{
+      const sel = document.getElementById('cat-filter');
+      if ([...sel.options].some(o => o.value === s.cat)) sel.value = s.cat;
+    }}
+    ['all','sat','sun','both'].forEach(t => {{
+      const b = document.getElementById('b-'+t);
+      b.className = 'db';
+      if (t === gDay) b.classList.add('db-'+t);
+    }});
+    ['all','morning','afternoon','evening'].forEach(k => {{
+      document.getElementById('t-'+k).className = 'tb'+(k===gTime?' tb-on':'');
+    }});
+  }} catch(e) {{}}
+}}
 
 function applyFilters() {{
   const q   = (document.getElementById('search').value||'').toLowerCase().trim();
@@ -1466,10 +1622,57 @@ function applyFilters() {{
   }});
   mcg.clearLayers();
   mcg.addLayers(filtered);
+  gFiltered = filtered;
   document.getElementById('result-count').textContent =
     filtered.length < allMarkers.length
       ? `${{filtered.length}} / ${{allMarkers.length}} venues`
       : `${{allMarkers.length}} venues`;
+  saveFilters();
+  renderList();
+}}
+
+// ── List view ─────────────────────────────────────────────────────────────────
+function renderList() {{
+  const body = document.getElementById('list-body');
+  if (!body) return;
+  document.getElementById('list-title').textContent = `Venues (${{gFiltered.length}})`;
+  if (!gFiltered.length) {{
+    body.innerHTML = '<div class="lv-empty">No venues match the current filters.</div>';
+    return;
+  }}
+  const sorted = [...gFiltered].sort((a,b) =>
+    (b._v.sat_acts.length + b._v.sun_acts.length) -
+    (a._v.sat_acts.length + a._v.sun_acts.length));
+  body.innerHTML = sorted.map(m => {{
+    const v = m._v;
+    const n = v.sat_acts.length + v.sun_acts.length;
+    const first = (v.sat_acts[0] || v.sun_acts[0] || {{}}).title || '';
+    return `<div class="lv-row" onclick="focusVenue(${{allMarkers.indexOf(m)}})">
+      <div class="lv-dot" style="background:${{CLR[v.day]}}"></div>
+      <div class="lv-txt">
+        <div class="lv-venue">${{v.name}}</div>
+        <div class="lv-preview">${{first}}</div>
+      </div>
+      <div class="lv-n">${{n}}</div>
+    </div>`;
+  }}).join('');
+}}
+
+function toggleList() {{
+  const p  = document.getElementById('list-panel');
+  const tg = document.getElementById('list-toggle');
+  const open = p.classList.toggle('open');
+  tg.innerHTML = open ? '🗺 Map' : '☰ List';
+  if (open) renderList();
+}}
+
+function focusVenue(idx) {{
+  const m = allMarkers[idx];
+  if (!m) return;
+  if (window.innerWidth <= 640) toggleList();   // close sheet on mobile
+  map.setView(m.getLatLng(), 16);
+  // Wait for cluster to expand at zoom 15+ before opening the popup
+  setTimeout(() => m.openPopup(), 320);
 }}
 
 function setDay(d) {{
@@ -1511,6 +1714,7 @@ leg.onAdd = () => {{
 leg.addTo(map);
 
 // ── Init ──────────────────────────────────────────────────────────────────────
+restoreFilters();
 applyFilters();
 
 // Hide loading overlay after two animation frames (map has started rendering)
@@ -1559,25 +1763,52 @@ def main():
     print(f"\n🗓  Weekend: {sat_label} (Sat) & {sun_label} (Sun)")
     print("=" * 60)
 
+    # Each source is independent: if one site breaks, log it and keep going
+    # so the map still deploys with the remaining sources.
+    source_errors = []
+
     # 1. Art-mate listing pages
     print("\n[1/5] Scraping art-mate.net listing pages…")
-    sat_ids = scrape_all_activities(sat_date)
-    sun_ids = scrape_all_activities(sun_date)
-    all_ids = {**sat_ids, **sun_ids}
-    print(f"  art-mate unique activities (both days): {len(all_ids)}")
+    sat_ids, sun_ids, all_ids, artmate_details = {}, {}, {}, []
+    try:
+        sat_ids = scrape_all_activities(sat_date)
+        sun_ids = scrape_all_activities(sun_date)
+        all_ids = {**sat_ids, **sun_ids}
+        print(f"  art-mate unique activities (both days): {len(all_ids)}")
 
-    # 2. Art-mate detail pages
-    print("\n[2/5] Fetching art-mate.net detail pages…")
-    artmate_details = fetch_all_details(all_ids, target_dates)
-    print(f"  Fetched {len(artmate_details)} detail pages")
+        # 2. Art-mate detail pages
+        print("\n[2/5] Fetching art-mate.net detail pages…")
+        artmate_details = fetch_all_details(all_ids, target_dates)
+        print(f"  Fetched {len(artmate_details)} detail pages")
+    except Exception as e:
+        source_errors.append(f"art-mate.net: {type(e).__name__}: {e}")
+        print(f"  ✗ art-mate.net failed, continuing: {e}", file=sys.stderr)
 
     # 3. Timable
     print("\n[3/5] Scraping timable.com…")
-    timable_acts = scrape_timable(sat_iso, sun_iso)
+    timable_acts = []
+    try:
+        timable_acts = scrape_timable(sat_iso, sun_iso)
+    except Exception as e:
+        source_errors.append(f"timable.com: {type(e).__name__}: {e}")
+        print(f"  ✗ timable.com failed, continuing: {e}", file=sys.stderr)
 
     # 4. XploreHK
     print("\n[4/5] Scraping xplorehk.com…")
-    xplorehk_acts = scrape_xplorehk(sat_iso, sun_iso)
+    xplorehk_acts = []
+    try:
+        xplorehk_acts = scrape_xplorehk(sat_iso, sun_iso)
+    except Exception as e:
+        source_errors.append(f"xplorehk.com: {type(e).__name__}: {e}")
+        print(f"  ✗ xplorehk.com failed, continuing: {e}", file=sys.stderr)
+
+    # If every source failed, the map would be empty — keep the old page instead
+    if not artmate_details and not timable_acts and not xplorehk_acts:
+        print("\n❌ All sources failed — aborting without writing output:",
+              file=sys.stderr)
+        for err in source_errors:
+            print(f"   {err}", file=sys.stderr)
+        sys.exit(1)
 
     # 5. Geocode & build venues
     print("\n[5/5] Geocoding venues and building map…")
@@ -1586,6 +1817,7 @@ def main():
         sat_iso, sun_iso, sat_ids, sun_ids
     )
     print(f"  Mapped {len(venues)} venue pins")
+    _save_geocode_cache()
     if ungeocodable:
         print(f"  Could not geocode {len(ungeocodable)} art-mate activities:")
         for a in ungeocodable[:5]:
@@ -1594,7 +1826,10 @@ def main():
             print(f"    … and {len(ungeocodable)-5} more")
 
     # Generate HTML
-    html = make_html(venues, sat_label, sun_label)
+    # Timestamp in HKT so visitors can see data freshness
+    hkt_now = datetime.utcnow() + timedelta(hours=8)
+    updated_label = hkt_now.strftime(" · updated %-d %b %H:%M")
+    html = make_html(venues, sat_label, sun_label, updated_label)
     out_path = Path(args.out).expanduser()
     out_path.write_text(html, encoding="utf-8")
 
@@ -1602,6 +1837,10 @@ def main():
     print(f"\n✅ Saved: {out_path}")
     print(f"   {len(venues)} venue pins · {total_acts} total activity entries")
     print(f"   art-mate: {len(all_ids)}  timable: {len(timable_acts)}  xplorehk: {len(xplorehk_acts)}")
+    if source_errors:
+        print("\n⚠️  Some sources failed this run (map built from the rest):")
+        for err in source_errors:
+            print(f"   {err}")
     print(f'\n   Open: open "{out_path}"')
 
 
