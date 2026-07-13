@@ -525,7 +525,7 @@ def scrape_timable(sat_iso, sun_iso):
         cat_items = [c.get("name", "") for c in (doc.get("categories") or []) if isinstance(c, dict)]
         category  = ", ".join(filter(None, cat_items))
 
-        TBD_RE = re.compile(r"待定|代定|TBC|TBD", re.I)
+TBD_RE = re.compile(r"待定|代定|TBC|TBD", re.I)
         
         for section in doc.get("sections") or []:
             coord = section.get("coordinate")   # [lng, lat]
