@@ -437,6 +437,7 @@ def _timable_section_on_date(section, target_date_str):
     to_this    = section.get("toThisDay")
     end_str    = section.get("endDatetime")
 
+    weekdays = section.get("recurrance", {}).get("weekday", [])
     if is_repeat and to_this:
         try:
             end_date = parse_hkt(to_this).date()
@@ -444,16 +445,16 @@ def _timable_section_on_date(section, target_date_str):
             return False, None
         if not (start_date <= target_date <= end_date):
             return False, None
-        weekdays = section.get("recurrance", {}).get("weekday", [])
-        if weekdays:
-            if target_date.strftime("%A").lower() not in weekdays:
-                return False, None
+        if weekdays and target_date.strftime("%A").lower() not in weekdays:
+            return False, None
     elif end_str:
         try:
             end_date = parse_hkt(end_str).date()
         except ValueError:
             return False, None
         if not (start_date <= target_date <= end_date):
+            return False, None
+        if weekdays and target_date.strftime("%A").lower() not in weekdays:
             return False, None
     else:
         if start_date != target_date:
@@ -506,12 +507,16 @@ def scrape_timable(sat_iso, sun_iso):
     acts = []
     seen = set()  # deduplicate by (event_id, sat, sun)
 
+    CANCELLED_RE = re.compile(r"^[（(]?(已)?取消[）)]?|[（(]?(已)?取消[）)]?$")
     for doc in all_docs:
         name      = (doc.get("name") or "").strip()
         event_id  = doc.get("id") or doc.get("_id") or ""
         permalink = doc.get("permalink") or ""
         if not name or not (event_id or permalink):
             continue
+        if CANCELLED_RE.search(name):
+            continue
+            
         # Hex ID URLs are reliable; permalink URLs return HTTP 500 on timable
         if event_id:
             url = f"https://timable.com/hk/zh/event/{event_id}"
@@ -520,6 +525,8 @@ def scrape_timable(sat_iso, sun_iso):
         cat_items = [c.get("name", "") for c in (doc.get("categories") or []) if isinstance(c, dict)]
         category  = ", ".join(filter(None, cat_items))
 
+        TBD_RE = re.compile(r"待定|代定|TBC|TBD", re.I)
+        
         for section in doc.get("sections") or []:
             coord = section.get("coordinate")   # [lng, lat]
             if not coord or len(coord) < 2:
@@ -529,6 +536,8 @@ def scrape_timable(sat_iso, sun_iso):
             except (TypeError, ValueError):
                 continue
             venue_name = (section.get("location") or {}).get("name", "") or ""
+            if TBD_RE.search(venue_name):
+                continue
             address    = section.get("address", "") or ""
 
             on_sat, sat_time = _timable_section_on_date(section, sat_iso)
@@ -848,6 +857,8 @@ def geocode(venue_name):
             _geocode_cache[venue_name] = None
             return None  # matched known venue but outside HK
 
+    if TBD_RE.search(venue_name):
+        return None
     # Nominatim fallback — HK only
     try:
         q = venue_name if "hong kong" in venue_name.lower() else venue_name + ", Hong Kong"
