@@ -40,7 +40,7 @@ TIMABLE_HEADERS = {
 
 # XploreHK Google Sheets config (public sheet + public API key)
 XPLOREHK_SHEET_ID = "1G_8RMWjf0T9sNdMxKYy_Fc051I6zhdLLy6ehLak4CX4"
-XPLOREHK_KEY      = "AIzaSyCPyerGljBK4JJ-XA3aRr5cRvWssI3rwhI"
+XPLOREHK_KEY      = os.environ["XPLOREHK_KEY"]
 
 # ── Known venue coordinates ─────────────────────────────────────────────────────
 KNOWN_VENUES = [
@@ -1651,15 +1651,15 @@ function renderList() {{
   body.innerHTML = sorted.map(m => {{
     const v = m._v;
     const n = v.sat_acts.length + v.sun_acts.length;
-    const first = (v.sat_acts[0] || v.sun_acts[0] || {{}}).title || '';
+    const first = esc((v.sat_acts[0] || v.sun_acts[0] || {{}}).title || '');
     return `<div class="lv-row" onclick="focusVenue(${{allMarkers.indexOf(m)}})">
       <div class="lv-dot" style="background:${{CLR[v.day]}}"></div>
       <div class="lv-txt">
-        <div class="lv-venue">${{v.name}}</div>
+        <div class="lv-venue">${{esc(v.name)}}</div>
         <div class="lv-preview">${{first}}</div>
       </div>
-      <div class="lv-n">${{n}}</div>
-    </div>`;
+  <div class="lv-n">${{n}}</div>
+</div>`;
   }}).join('');
 }}
 
@@ -1774,7 +1774,7 @@ def main():
 
     # 1. Art-mate listing pages
     print("\n[1/5] Scraping art-mate.net listing pages…")
-    sat_ids, sun_ids, all_ids, artmate_details = {}, {}, {}, []
+    sat_ids, sun_ids, all_ids, artmate_details = {}, {}, {}, {}
     try:
         sat_ids = scrape_all_activities(sat_date)
         sun_ids = scrape_all_activities(sun_date)
