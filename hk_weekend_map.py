@@ -1017,7 +1017,7 @@ def make_html(venues, sat_label, sun_label, updated_label=""):  # noqa: C901
         for c in sorted(cats_set, key=_cat_sort)
     )
 
-    venues_json = json.dumps(venues, ensure_ascii=False)
+    venues_json = json.dumps(venues, ensure_ascii=False).replace("<", "\\u003c")
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1486,6 +1486,11 @@ new ResetControl({{position:'topleft'}}).addTo(map);
 new LocateControl({{position:'topleft'}}).addTo(map);
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+function esc(s) {{
+  return String(s ?? '').replace(/[&<>"']/g, c => ({{
+    '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'
+  }})[c]);
+}}
 function getHour(s) {{
   if (!s) return null;
   s = s.replace(/\d{{4}}-\d{{2}}-\d{{2}}/g,'');
