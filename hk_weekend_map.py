@@ -1524,11 +1524,11 @@ function buildPopup(v) {{
     html += `<div class="pd"><span class="badge bs">🔴 Sat {sat_label[:6]}</span></div>`;
     for (const a of v.sat_acts) {{
       html += `<div class="pe">
-        <div class="pt">${{a.title}}</div>
-        <div class="pm">⏰ ${{a.times.join('<br>')}}</div>
-        <a class="al" href="${{a.url}}" target="_blank">→ ${{a.source||'art-mate.net'}}</a>
-        ${{srcBadge(a.source)}}
-      </div>`;
+        <div class="pt">${{esc(a.title)}}</div>
+        <div class="pm">⏰ ${{a.times.map(esc).join('<br>')}}</div>
+        <a class="al" href="${{esc(a.url)}}" target="_blank">→ ${{esc(a.source||'art-mate.net')}}</a>
+    ${{srcBadge(a.source)}}
+  </div>`;
     }}
   }}
   if (v.sun_acts.length) {{
