@@ -1,0 +1,81 @@
+name: Update HK Weekend Map
+
+on:
+  schedule:
+    - cron: '0 1 * * *'   # Every day 01:00 UTC = 09:00 HKT
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  update-and-deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v7
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Scrape and generate map
+        env:
+          XPLOREHK_KEY: ${{ secrets.XPLOREHK_KEY }}
+        run: |
+          set -euo pipefail
+          python3 hk_weekend_map.py --out index.html
+          echo "Generated $(wc -c < index.html) bytes"
+
+      - name: Verify upcoming weekend dates in output
+        run: |
+          set -euo pipefail
+          python3 -c "
+          from datetime import datetime, timedelta
+          today = datetime.utcnow() + timedelta(hours=8)  # HKT
+          dow = today.weekday()
+          if dow == 5: days = 0
+          elif dow == 6: days = -1
+          else: days = 5 - dow
+          sat = today + timedelta(days=days)
+          sun = sat + timedelta(days=1)
+          expected_sat = sat.strftime('%-d %b %Y')
+          expected_sun = sun.strftime('%-d %b %Y')
+          with open('index.html') as f:
+              html = f.read()
+          assert expected_sat in html, f'Missing Saturday {expected_sat}'
+          assert expected_sun in html, f'Missing Sunday {expected_sun}'
+          print(f'Verified: {expected_sat} (Sat) & {expected_sun} (Sun)')
+          "
+
+      - name: Commit updated map back to repo
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add index.html geocode_cache.json
+          git diff --staged --quiet \
+            || git commit -m "chore: refresh weekend map $(date -u '+%Y-%m-%d')"
+          git push
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v6
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: .
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5
