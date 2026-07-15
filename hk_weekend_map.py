@@ -10,6 +10,7 @@ Usage:
     python3 hk_weekend_map.py --out ~/Desktop/hk_weekend_map.html
 """
 
+import os
 import re
 import sys
 import json
@@ -40,7 +41,10 @@ TIMABLE_HEADERS = {
 
 # XploreHK Google Sheets config (public sheet + public API key)
 XPLOREHK_SHEET_ID = "1G_8RMWjf0T9sNdMxKYy_Fc051I6zhdLLy6ehLak4CX4"
-XPLOREHK_KEY      = os.environ["XPLOREHK_KEY"]
+XPLOREHK_KEY      = os.environ.get("XPLOREHK_KEY", "")
+
+# Venues whose location is still to be confirmed — skip them entirely
+TBD_RE = re.compile(r"待定|代定|TBC|TBD", re.I)
 
 # ── Known venue coordinates ─────────────────────────────────────────────────────
 KNOWN_VENUES = [
@@ -525,8 +529,6 @@ def scrape_timable(sat_iso, sun_iso):
         cat_items = [c.get("name", "") for c in (doc.get("categories") or []) if isinstance(c, dict)]
         category  = ", ".join(filter(None, cat_items))
 
-TBD_RE = re.compile(r"待定|代定|TBC|TBD", re.I)
-        
         for section in doc.get("sections") or []:
             coord = section.get("coordinate")   # [lng, lat]
             if not coord or len(coord) < 2:
