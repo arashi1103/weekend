@@ -30,12 +30,9 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Run scraper
+      - name: Scrape and generate map
         env:
           XPLOREHK_KEY: ${{ secrets.XPLOREHK_KEY }}
-        run: python hk_weekend_map.py
-
-      - name: Scrape and generate map
         run: |
           set -euo pipefail
           python3 hk_weekend_map.py --out index.html
