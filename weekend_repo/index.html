@@ -327,10 +327,9 @@ const map = L.map('map', {
   minZoom:              10,
 }).setView(HK_CENTER, HK_ZOOM);
 
-// CartoDB Positron — clean, no terrain labels or contour lines
-L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
-  attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors © <a href="https://carto.com/attributions">CARTO</a>',
-  subdomains: 'abcd',
+// OpenFreeMap Positron — clean light basemap, no API key required
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
   maxZoom: 19,
 }).addTo(map);
 
